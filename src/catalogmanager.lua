@@ -1,10 +1,5 @@
 local OPDSClient = require("opdsclient")
 local url = require("socket.url")
-local util = require("util")
-local http = require("socket.http")
-local ltn12 = require("ltn12")
-local socket = require("socket")
-local socketutil = require("socketutil")
 local logger = require("logger")
 local _ = require("gettext")
 
@@ -67,14 +62,14 @@ function CatalogManager:genItemTableFromCatalog(catalog, item_url)
         for __, link in ipairs(feed.link) do
             if link.type ~= nil and link.rel and link.href then
                 local link_href = build_href(link.href)
-                
+
                 -- Always add the link to hrefs if it has a rel and href
                 -- Navigation links (prev, next, start, first, last) take priority
                 -- and won't be overwritten by later processing of the same rel
                 if not hrefs[link.rel] then
                     hrefs[link.rel] = link_href
                 end
-                
+
                 -- OpenSearch
                 if link.type:find(self.client.search_type) then
                     if link.href then
@@ -215,10 +210,10 @@ function CatalogManager:genItemTableFromURL(item_url, username, password)
     local current_url = item_url
     local facet_groups, search_url, opensearch_data
     local page_count = 0
-    
+
     while current_url do
         page_count = page_count + 1
-        
+
         local ok, catalog = pcall(self.client.parseFeed, self.client, current_url, username, password)
         if not ok then
             if page_count == 1 then -- Only return error if first page fails
@@ -232,9 +227,9 @@ function CatalogManager:genItemTableFromURL(item_url, username, password)
             end
             break
         end
-        
+
         local page_items, page_facets, page_search = self:genItemTableFromCatalog(catalog, current_url)
-        
+
         -- Store metadata from first page only
         if not facet_groups then
             facet_groups = page_facets
@@ -243,12 +238,12 @@ function CatalogManager:genItemTableFromURL(item_url, username, password)
                 opensearch_data = catalog.opensearch
             end
         end
-        
+
         -- Add items from this page
         for _, item in ipairs(page_items) do
             table.insert(all_items, item)
         end
-        
+
         -- Check for next page link
         local next_url = page_items.hrefs and page_items.hrefs.next or nil
         if next_url and next_url ~= current_url then
@@ -256,130 +251,15 @@ function CatalogManager:genItemTableFromURL(item_url, username, password)
         else
             current_url = nil
         end
-        
+
         -- Safety limit to prevent infinite loops
         if page_count > 50 then
             logger.warn("CatalogManager:genItemTableFromURL - Reached safety limit of 50 pages")
             break
         end
     end
-    
+
     return all_items, facet_groups, search_url, nil, opensearch_data
-end
-
--- Extracts special feed URLs from root catalog
-function CatalogManager:extractSpecialFeeds(catalog, base_url)
-    local special_urls = {}
-
-    if not catalog or not catalog.feed or not catalog.feed.entry then
-        return special_urls
-    end
-
-    local function build_href(href)
-        return url.absolute(base_url, href)
-    end
-
-    for _, entry in ipairs(catalog.feed.entry) do
-        local entry_id = entry.id
-        if entry_id and entry.link then
-            for _, link in ipairs(entry.link) do
-                if link.rel == "subsection" and link.href then
-                    -- Map entry IDs to special feed types
-                    for feed_type, feed_id in pairs(self.special_feeds) do
-                        if entry_id == feed_id then
-                            special_urls[feed_type] = build_href(link.href)
-                            break
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    return special_urls
-end
-
--- Helper function to get a specific special feed
-function CatalogManager:getSpecialFeed(feed_type, root_url, username, password)
-    -- First get the root catalog to extract special feed URLs
-    local ok, catalog = pcall(self.client.parseFeed, self.client, root_url, username, password)
-    if not ok then
-        return nil, catalog -- return error as second value
-    end
-
-    local special_urls = self:extractSpecialFeeds(catalog, root_url)
-    local feed_url = special_urls[feed_type]
-
-    if not feed_url then
-        return nil, _("Special feed not found")
-    end
-
-    -- Now fetch the actual special feed
-    return self:genItemTableFromURL(feed_url, username, password)
-end
-
--- Convenience functions for specific feeds
-function CatalogManager:getOnDeck(root_url, username, password)
-    return self:getSpecialFeed("on_deck", root_url, username, password)
-end
-
-function CatalogManager:getRecentlyAdded(root_url, username, password)
-    return self:getSpecialFeed("recently_added", root_url, username, password)
-end
-
-function CatalogManager:getRecentlyUpdated(root_url, username, password)
-    return self:getSpecialFeed("recently_updated", root_url, username, password)
-end
-
-function CatalogManager:getReadingLists(root_url, username, password)
-    return self:getSpecialFeed("reading_lists", root_url, username, password)
-end
-
-function CatalogManager:getWantToRead(root_url, username, password)
-    return self:getSpecialFeed("want_to_read", root_url, username, password)
-end
-
-function CatalogManager:getAllLibraries(root_url, username, password)
-    return self:getSpecialFeed("all_libraries", root_url, username, password)
-end
-
-function CatalogManager:getAllCollections(root_url, username, password)
-    return self:getSpecialFeed("all_collections", root_url, username, password)
-end
-
--- Downloads an image from the given URL using the configured authentication
-function CatalogManager:downloadImage(image_url)
-    local parsed = url.parse(image_url)
-    if not parsed then
-        return nil, "Invalid URL"
-    end
-
-    if parsed.scheme ~= "http" and parsed.scheme ~= "https" then
-        return nil, "Unsupported URL scheme"
-    end
-
-    local image_data = {}
-    local code, headers, status
-
-    socketutil:set_timeout(socketutil.FILE_BLOCK_TIMEOUT, socketutil.FILE_TOTAL_TIMEOUT)
-    code, headers, status = socket.skip(1, http.request {
-        url = image_url,
-        headers = {
-            ["Accept-Encoding"] = "identity",
-            ["User-Agent"] = "KOReader/1.0",
-            ["Accept"] = "image/*",
-        },
-        sink = ltn12.sink.table(image_data),
-        user = self.username,
-        password = self.password,
-    })
-    socketutil:reset_timeout()
-
-    if code == 200 and image_data and #image_data > 0 then
-        return table.concat(image_data)
-    else
-        return nil, "HTTP request failed with code: " .. tostring(code)
-    end
 end
 
 return CatalogManager

@@ -2,21 +2,23 @@ local _ = require("gettext")
 
 local KamareOptions = {
     prefix = "kamare",
-    {
-        icon = "appbar.pageview",
-        options = {
-            {
-                name = "reading_mode",
-                name_text = _("Reading Mode"),
-                toggle = {_("Page Mode"), _("Continuous Mode")},
-                values = {0, 1},
-                args = {0, 1},
-                default_value = 0,
-                event = "SetReadingMode",
-                help_text = _("Page mode for manga (default) or continuous mode for manhwa/long strip content."),
-            },
-        }
-    },
+    --[[
+        {
+            icon = "appbar.pageview",
+            options = {
+                {
+                    name = "reading_mode",
+                    name_text = _("Reading Mode"),
+                    toggle = {_("Page Mode"), _("Continuous Mode")},
+                    values = {0, 1},
+                    args = {0, 1},
+                    default_value = 0,
+                    event = "SetReadingMode",
+                    help_text = _("Page mode for manga (default) or continuous mode for manhwa/long strip content."),
+                },
+            }
+        },
+    ]]
     {
         icon = "appbar.settings",
         options = {

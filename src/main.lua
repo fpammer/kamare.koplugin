@@ -53,19 +53,6 @@ function Kamare:onShowOPDSCatalog()
         }
     end
 
---[[
-    self.grid_browser = GridBrowser:new{
-        title = _("Kavita Manga Reader"),
-        server_config = server_config,
-        close_callback = function()
-            UIManager:close(self.grid_browser)
-            self.grid_browser = nil
-        end,
-    }
-
-    UIManager:show(self.grid_browser)
-]]
-
     self.opds_browser = OPDSBrowser:new{
         servers = self.servers,
         settings = self.settings,

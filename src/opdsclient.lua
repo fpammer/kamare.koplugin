@@ -10,7 +10,7 @@ local url = require("socket.url")
 local _ = require("gettext")
 
 -- cache catalog parsed from feed xml
-local CatalogCache = Cache:new{
+local FeedCache = Cache:new{
     -- Make it 20 slots, with no storage space constraints
     slots = 20,
 }
@@ -71,7 +71,7 @@ function OPDSClient:parseFeed(item_url, username, password)
     local hash = "opds|catalog|" .. item_url
 
     -- Check if we have a cached version and if it's still fresh (5 minutes)
-    local ok, cached_data = pcall(CatalogCache.check, CatalogCache, hash)
+    local ok, cached_data = pcall(FeedCache.check, FeedCache, hash)
     if ok and cached_data then
         local cache_age = os.time() - (cached_data.timestamp or 0)
         if cache_age < 300 then -- 5 minutes
@@ -101,7 +101,7 @@ function OPDSClient:parseFeed(item_url, username, password)
         feed = parsed_feed_or_error,
         timestamp = os.time()
     }
-    local ok, cache_error = pcall(CatalogCache.insert, CatalogCache, hash, cache_data)
+    local ok, cache_error = pcall(FeedCache.insert, FeedCache, hash, cache_data)
     if not ok then
         logger.warn("OPDSClient:parseFeed - Cache insertion failed:", cache_error)
     end
@@ -139,7 +139,7 @@ function OPDSClient:getSearchTemplate(osd_url, username, password)
     local search_hash = "opds|search_template|" .. osd_url
 
     -- Check cache first
-    local ok, cached_template = pcall(CatalogCache.check, CatalogCache, search_hash)
+    local ok, cached_template = pcall(FeedCache.check, FeedCache, search_hash)
     if ok and cached_template then
         local cache_age = os.time() - (cached_template.timestamp or 0)
         if cache_age < 86400 then -- 24 hours
@@ -166,7 +166,7 @@ function OPDSClient:getSearchTemplate(osd_url, username, password)
             template = search_template,
             timestamp = os.time()
         }
-        local ok, cache_error = pcall(CatalogCache.insert, CatalogCache, search_hash, cache_data)
+        local ok, cache_error = pcall(FeedCache.insert, FeedCache, search_hash, cache_data)
         if not ok then
             logger.warn("OPDSClient:getSearchTemplate - Cache insertion failed:", cache_error)
         end
