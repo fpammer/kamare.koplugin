@@ -874,6 +874,16 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name)
         end
     end
 
+    local preloaded_iswide = {}
+    if type(preloaded_dimensions) == "table" then
+        for _, d in ipairs(preloaded_dimensions) do
+            local pn = d.pageNumber or d.page or d.page_num
+            if type(pn) == "number" then
+                preloaded_iswide[pn] = d.isWide and true or false
+            end
+        end
+    end
+
     local KamareImageViewer = require("kamareimageviewer")
     local viewer = KamareImageViewer:new{
         images_list_data = images_list_data,
@@ -882,6 +892,7 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name)
         with_title_bar = false,
         images_list_nb = pages,
         preloaded_dimensions = preloaded_dimensions,
+        preloaded_iswide = preloaded_iswide,
         metadata = metadata,
         on_close_callback = function(current_page, total_pages)
             logger.dbg("Reader closed - ended at page", current_page, "of", total_pages)
@@ -905,6 +916,16 @@ function KavitaBrowser:onMenuSelect(item)
     -- Only Kavita items are supported
     if item.kavita_chapter and item.chapter and item.chapter.id then
         self:launchKavitaChapterViewer(item.chapter, self.catalog_title or self.current_server_name)
+        return true
+    end
+    if item.kavita_volume and item.volume and item.volume.id then
+        local vol = item.volume
+        local ch = (type(vol.chapters) == "table") and vol.chapters[1] or nil
+        if ch and ch.id then
+            self:launchKavitaChapterViewer(ch, self.catalog_title or self.current_server_name)
+        else
+            UIManager:show(InfoMessage:new{ text = _("No chapters in this volume") })
+        end
         return true
     end
     if item.kavita_recently_added and item.recent and item.recent.seriesId then

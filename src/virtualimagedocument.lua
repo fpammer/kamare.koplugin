@@ -6,6 +6,18 @@ local Blitbuffer = require("ffi/blitbuffer")
 local TileCacheItem = require("document/tilecacheitem")
 local DocCache = require("document/doccache")
 
+-- Debug helpers
+local function rectToStr(r)
+    if not r then return "nil" end
+    local x = r.x or (r.x0 or 0)
+    local y = r.y or (r.y0 or 0)
+    local w = r.w or ((r.x1 or 0) - (r.x0 or 0))
+    local h = r.h or ((r.y1 or 0) - (r.y0 or 0))
+    return string.format("x=%d y=%d w=%d h=%d", x, y, w, h)
+end
+
+local function boolStr(b) return b and "true" or "false" end
+
 local mupdf = nil -- Declared as nil initially
 
 local VirtualImageDocument = Document:extend{
@@ -180,6 +192,10 @@ local function getImageSizeFromHeader(raw)
     return nil
 end
 
+local function isPositiveDimension(w, h)
+    return w and h and w > 0 and h > 0
+end
+
 function VirtualImageDocument:init()
     Document._init(self)  -- Call base init
 
@@ -192,10 +208,6 @@ function VirtualImageDocument:init()
     self._pages = self.pages_override or #self.images_list
     -- Lazy cache for native dimensions
     self._dims_cache = {}
-
-    logger.dbg("VirtualImageDocument:init - images_list type:", type(self.images_list))
-    logger.dbg("VirtualImageDocument:init - images_list length:", self._pages)
-    -- (debug peek suppressed to avoid triggering lazy fetches)
 
     if self._pages == 0 then
         logger.warn("VirtualImageDocument: No images provided")
@@ -214,7 +226,6 @@ function VirtualImageDocument:init()
 
     self:updateColorRendering()
 
-    logger.dbg("VirtualImageDocument: Initialized with", self._pages, "images (lazy dims)")
 end
 
 function VirtualImageDocument:close()
@@ -223,6 +234,79 @@ function VirtualImageDocument:close()
     self.is_open = false
     self._dims_cache = nil
     return true
+end
+
+function VirtualImageDocument:_getRawImageData(pageno)
+    local entry = self.images_list and self.images_list[pageno]
+    if type(entry) == "function" then
+        local ok, result = pcall(entry)
+        if ok then
+            entry = result
+        else
+            return nil, "supplier_error", result
+        end
+    end
+    if type(entry) ~= "string" or #entry == 0 then
+        return nil, "invalid_data", nil
+    end
+    return entry, nil, nil
+end
+
+function VirtualImageDocument:_openImageDoc(raw_data, magic, opts)
+    opts = opts or {}
+    if not magic then return nil end
+    if not mupdf then mupdf = require("ffi/mupdf") end
+    local ok, doc_or_err = pcall(mupdf.openDocumentFromText, raw_data, magic, nil)
+    if ok and doc_or_err and doc_or_err.doc then
+        return doc_or_err
+    end
+    if not opts.silent then
+        logger.warn("Failed to open mini-doc for page", opts.pageno or "?", ":", doc_or_err)
+    end
+    return nil
+end
+
+function VirtualImageDocument:_determineNativeDims(raw_data, opts)
+    opts = opts or {}
+    local magic = opts.magic or detectImageMagic(raw_data)
+    local w_hdr, h_hdr = getImageSizeFromHeader(raw_data)
+    local doc = opts.doc
+    local doc_created = false
+    if not doc and magic and (opts.open_doc or not isPositiveDimension(w_hdr, h_hdr)) then
+        doc = self:_openImageDoc(raw_data, magic, {
+            silent = opts.silent_doc_fail,
+            pageno = opts.pageno,
+        })
+        doc_created = doc ~= nil
+    end
+
+    local w, h
+    local dims_source
+    if doc then
+        doc:setColorRendering(self.render_color)
+        local page = doc:openPage(1)
+        w, h = page:getSize(self.dc_null)
+        page:close()
+        if isPositiveDimension(w, h) then
+            dims_source = "mupdf"
+        end
+        if not opts.keep_doc and doc_created then
+            doc:close()
+            doc = nil
+        end
+    end
+
+    if not isPositiveDimension(w, h) and isPositiveDimension(w_hdr, h_hdr) then
+        w, h = w_hdr, h_hdr
+        dims_source = dims_source or "header"
+    end
+
+    if not isPositiveDimension(w, h) then
+        w, h = 800, 1200
+        dims_source = dims_source or "fallback"
+    end
+
+    return w, h, magic, doc, w_hdr, h_hdr, dims_source
 end
 
 function VirtualImageDocument:getDocumentProps()
@@ -239,17 +323,21 @@ end
 
 function VirtualImageDocument:getNativePageDimensions(pageno)
     if pageno < 1 or pageno > self._pages then
-        logger.warn("Invalid pageno:", pageno, "valid range: 1 -", self._pages)
+        logger.warn("getNativePageDimensions: invalid pageno", pageno, "valid:", 1, self._pages)
         return Geom:new{ w = 0, h = 0 }
     end
 
-    -- Return cached dims if available
     local cached = self._dims_cache and self._dims_cache[pageno]
     if cached then
         return cached
     end
 
-    -- No fetching here: return a sane fallback until renderPage computes real dims.
+    self:ensureDims(pageno)
+    cached = self._dims_cache and self._dims_cache[pageno]
+    if cached then
+        return cached
+    end
+
     return Geom:new{ w = 800, h = 1200 }
 end
 
@@ -266,7 +354,33 @@ function VirtualImageDocument:preloadDimensions(list)
             count = count + 1
         end
     end
-    logger.dbg("VirtualImageDocument: preloaded dims for", count, "pages")
+    if count > 0 then
+        local sample = list[1]
+        if sample then
+            local pn = sample.pageNumber or sample.page or sample.page_num
+        end
+    end
+end
+
+function VirtualImageDocument:ensureDims(pageno)
+    if pageno < 1 or pageno > self._pages then return end
+    self._dims_cache = self._dims_cache or {}
+    local cached = self._dims_cache[pageno]
+    if cached and isPositiveDimension(cached.w, cached.h) then
+        return
+    end
+
+    local raw_data, err_kind = self:_getRawImageData(pageno)
+    local w, h = 800, 1200
+    if raw_data then
+        w, h = self:_determineNativeDims(raw_data, {
+            silent_doc_fail = true,
+            pageno = pageno,
+        })
+    elseif err_kind == "supplier_error" then
+    end
+
+    self._dims_cache[pageno] = Geom:new{ w = w, h = h }
 end
 
 function VirtualImageDocument:getUsedBBox(pageno)
@@ -310,12 +424,10 @@ function VirtualImageDocument:_calculateVirtualLayout()
     end
 
     self.total_virtual_height = math.max(0, current_y - gap_between_images)
-    logger.dbg("Virtual document height:", self.total_virtual_height)
 end
 
 function VirtualImageDocument:getVirtualHeight(zoom)
     if not self.total_virtual_height then
-        logger.warn("total_virtual_height is nil, recalculating layout")
         self:_calculateVirtualLayout()
     end
     return (self.total_virtual_height or 0) * (zoom or 1.0)
@@ -361,30 +473,24 @@ function VirtualImageDocument:getToc()
 end
 
 function VirtualImageDocument:getPageLinks(pageno)
-    -- No links, but for consistency, open mini-doc
-    local raw_data = self.images_list[pageno]
-    if type(raw_data) == "function" then
-        local ok, result = pcall(raw_data)
-        if ok then raw_data = result end
-    end
-    if type(raw_data) ~= "string" or #raw_data == 0 then
+    local raw_data = self:_getRawImageData(pageno)
+    if not raw_data then
         return {}
     end
 
     local magic = detectImageMagic(raw_data)
     if not magic then return {} end
 
-    local ok, doc_or_err = pcall(mupdf.openDocumentFromText, raw_data, magic, nil)
-    if not ok or not doc_or_err or doc_or_err.doc == nil then
+    local doc = self:_openImageDoc(raw_data, magic, { silent = true, pageno = pageno })
+    if not doc then
         return {}
     end
 
-    local img_doc = doc_or_err
-    img_doc:setColorRendering(self.render_color)
-    local page = img_doc:openPage(1)
+    doc:setColorRendering(self.render_color)
+    local page = doc:openPage(1)
     local links = page:getPageLinks()
     page:close()
-    img_doc:close()
+    doc:close()
     return links
 end
 
@@ -407,28 +513,40 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation, gamma)
     local tile = DocCache:check(hash, TileCacheItem)
     if tile then
         if self.tile_cache_validity_ts and tile.created_ts < self.tile_cache_validity_ts then
-            logger.dbg("Stale tile, discarding")
         else
+            -- Derive native dims from cached full-page tile so viewers can refit correctly on first display.
+            if not rect and zoom and zoom > 0 and tile.bb then
+                local dw = tile.bb:getWidth()
+                local dh = tile.bb:getHeight()
+                if dw and dh and dw > 0 and dh > 0 then
+                    local w = dw / zoom
+                    local h = dh / zoom
+                    local rot = rotation or 0
+                    if rot == 90 or rot == 270 then
+                        w, h = h, w
+                    end
+                    self._dims_cache = self._dims_cache or {}
+                    local cached = self._dims_cache[pageno]
+                    local function diff(a, b) return math.abs((a or 0) - (b or 0)) end
+                    if not cached or diff(cached.w, w) > 0.5 or diff(cached.h, h) > 0.5 then
+                        self._dims_cache[pageno] = Geom:new{ w = w, h = h }
+                    end
+                end
+            end
             return tile
         end
     end
 
     -- Resolve raw data from supplier (single touch per render)
-    local raw_data = self.images_list[pageno]
-    if type(raw_data) == "function" then
-        local ok, result = pcall(raw_data)
-        if ok then
-            raw_data = result
+    local raw_data, err_kind, err_detail = self:_getRawImageData(pageno)
+    if not raw_data then
+        if err_kind == "supplier_error" then
+            logger.warn("Supplier failed for page", pageno, ":", err_detail)
         else
-            logger.warn("Supplier failed for page", pageno, ":", result)
-            raw_data = nil
+            logger.warn("Invalid image data for page", pageno, "- creating placeholder")
         end
-    end
-    logger.dbg("Rendering page", pageno, "- raw_data type:", type(raw_data), "length:", type(raw_data)=="string" and #raw_data or "N/A")
-    if type(raw_data) ~= "string" or #raw_data == 0 then
-        logger.warn("Invalid image data for page", pageno, "- creating placeholder")
         local placeholder_w, placeholder_h = 800, 1200
-        local tile = TileCacheItem:new{
+        local placeholder = TileCacheItem:new{
             persistent = not rect,
             doc_path = self.file,
             created_ts = os.time(),
@@ -436,41 +554,32 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation, gamma)
             pageno = pageno,
             bb = Blitbuffer.new(placeholder_w, placeholder_h, self.render_color and Blitbuffer.TYPE_BBRGB32 or Blitbuffer.TYPE_BB8),
         }
-        tile.bb:fill(Blitbuffer.COLOR_LIGHT_GRAY)
-        tile.size = tonumber(tile.bb.stride) * tile.bb.h + 512
-        return tile
+        placeholder.bb:fill(Blitbuffer.COLOR_LIGHT_GRAY)
+        placeholder.size = tonumber(placeholder.bb.stride) * placeholder.bb.h + 512
+        return placeholder
     end
 
-    -- Determine native dimensions from data, and cache them
-    local w, h
-    local w_hdr, h_hdr = getImageSizeFromHeader(raw_data)
-    if w_hdr and h_hdr then
-        w, h = w_hdr, h_hdr
-    else
-        local magic_dims = detectImageMagic(raw_data)
-        if magic_dims then
-            local ok_m, doc_or_err_m = pcall(mupdf.openDocumentFromText, raw_data, magic_dims, nil)
-            if ok_m and doc_or_err_m and doc_or_err_m.doc then
-                local img_doc_m = doc_or_err_m
-                local page_m = img_doc_m:openPage(1)
-                w, h = page_m:getSize(self.dc_null)
-                page_m:close()
-                img_doc_m:close()
-            end
-        end
+    -- Determine native dimensions (re-uses MuPDF doc when available)
+    local w, h, magic, doc, w_hdr, h_hdr, dims_source = self:_determineNativeDims(raw_data, {
+        open_doc = true,
+        keep_doc = true,
+        pageno = pageno,
+    })
+
+    if doc and isPositiveDimension(w_hdr, h_hdr) and (w ~= w_hdr or h ~= h_hdr) then
     end
-    if not (w and h and w > 0 and h > 0) then
+    if not isPositiveDimension(w, h) then
         w, h = 800, 1200
     end
     local native_dims = Geom:new{ w = w, h = h }
-    if self._dims_cache then
-        self._dims_cache[pageno] = native_dims
-    end
+    self._dims_cache = self._dims_cache or {}
+    self._dims_cache[pageno] = native_dims
 
     -- Compute render size & offsets (mirror core Document semantics) without fetching
     local page_size = self:transformRect(native_dims, zoom, rotation)
     if page_size.w == 0 or page_size.h == 0 then
         logger.warn("Zero page size for", pageno, "- cannot render")
+        if doc then doc:close() end
         return nil
     end
 
@@ -484,12 +593,21 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation, gamma)
             r:transformByScale(zoom)
             size = r
         end
-        offset_x = rect.x or 0
-        offset_y = rect.y or 0
+        -- Convert rect offsets to device-space and shift negatively so the viewport fills the tile.
+        local sx, sy
+        if rect.scaled_rect then
+            sx = rect.scaled_rect.x or 0
+            sy = rect.scaled_rect.y or 0
+        else
+            sx = math.floor((rect.x or 0) * zoom + 0.5)
+            sy = math.floor((rect.y or 0) * zoom + 0.5)
+        end
+        offset_x = -sx
+        offset_y = -sy
     end
 
     -- Create BB and TileCacheItem
-    local tile = TileCacheItem:new{
+    tile = TileCacheItem:new{
         persistent = not rect,  -- Don't persist excerpts
         doc_path = self.file,
         created_ts = os.time(),
@@ -498,43 +616,41 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation, gamma)
         bb = Blitbuffer.new(size.w, size.h, self.render_color and Blitbuffer.TYPE_BBRGB32 or Blitbuffer.TYPE_BB8),
     }
     tile.size = tonumber(tile.bb.stride) * tile.bb.h + 512
+    local approx_bpp = tonumber(tile.bb.stride) / tile.bb:getWidth()
 
     -- Try MuPDF mini-doc rendering
-    local magic = detectImageMagic(raw_data)
     local rendered_bb = nil
-    if magic then
-        local ok, doc_or_err = pcall(mupdf.openDocumentFromText, raw_data, magic, nil)
-        if ok and doc_or_err and doc_or_err.doc then
-            local img_doc = doc_or_err
-            img_doc:setColorRendering(self.render_color)
-            local page = img_doc:openPage(1)
-
-            -- Setup DC
-            local dc = DrawContext.new()
-            dc:setRotate(rotation)
-            if rotation == 90 then
-                dc:setOffset(page_size.w, 0)
-            elseif rotation == 180 then
-                dc:setOffset(page_size.w, page_size.h)
-            elseif rotation == 270 then
-                dc:setOffset(0, page_size.h)
-            end
-            dc:setZoom(zoom)
-            if gamma ~= self.GAMMA_NO_GAMMA then
-                dc:setGamma(gamma)
-            end
-
-            -- Draw directly into the destination tile
-            page:draw(dc, tile.bb, offset_x, offset_y, self.render_mode or 0)
-            page:close()
-            img_doc:close()
-            rendered_bb = tile.bb
-        else
-            logger.warn("Failed to open mini-doc for rendering page", pageno, ":", doc_or_err)
+    local doc_for_render = doc
+    if not doc_for_render and magic then
+        doc_for_render = self:_openImageDoc(raw_data, magic, { pageno = pageno })
+        if doc_for_render then
+            doc_for_render:setColorRendering(self.render_color)
         end
     end
+    if doc_for_render then
+        local page = doc_for_render:openPage(1)
 
-    if not rendered_bb then
+        -- Setup DC
+        local dc = DrawContext.new()
+        dc:setRotate(rotation)
+        if rotation == 90 then
+            dc:setOffset(page_size.w, 0)
+        elseif rotation == 180 then
+            dc:setOffset(page_size.w, page_size.h)
+        elseif rotation == 270 then
+            dc:setOffset(0, page_size.h)
+        end
+        dc:setZoom(zoom)
+        if gamma ~= self.GAMMA_NO_GAMMA then
+            dc:setGamma(gamma)
+        end
+
+        -- Draw directly into the destination tile
+        page:draw(dc, tile.bb, offset_x, offset_y, self.render_mode or 0)
+        page:close()
+        rendered_bb = tile.bb
+        doc_for_render:close()
+    else
         logger.warn("Failed to render page", pageno, "- using placeholder")
         tile.bb:fill(Blitbuffer.COLOR_LIGHT_GRAY)
     end
@@ -544,7 +660,6 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation, gamma)
         DocCache:insert(hash, tile)
     end
 
-    logger.dbg("Rendered page", pageno, "to tile (excerpt:", rect and "yes" or "no", ")")
     return tile
 end
 

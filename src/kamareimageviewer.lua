@@ -42,7 +42,7 @@ local BlitBufferWidget = ImageWidget:extend{
 function BlitBufferWidget:init()
     -- Set image to the provided blitbuffer
     -- NOTE: The parent _init has already been called by :new(), and ImageWidget
-    --       does not define an init(), so don’t call it here.
+    --       does not define an init(), so don't call it here.
     self.image = self.blitbuffer
 end
 
@@ -74,14 +74,14 @@ local KamareImageViewer = InputContainer:extend{
         icons = {
             time = "⌚",
             pages_left_book = "⇒",
-            battery = "",
+            battery = "",
             percentage = "⤠",
             book_time_to_read = "⏳",
         },
         compact_items = {
             time = nil,
             pages_left_book = "›",
-            battery = "",
+            battery = "",
             percentage = nil,
             book_time_to_read = nil
         }
@@ -379,10 +379,7 @@ function KamareImageViewer:init()
 end
 
 function KamareImageViewer:registerKeyEvents()
-    logger.dbg("registerKeyEvents called")
-
     if not Device:hasKeys() then
-        logger.dbg("No keys available, skipping key event registration")
         return
     end
 
@@ -391,8 +388,6 @@ function KamareImageViewer:registerKeyEvents()
         ShowPrevImage = { { Device.input.group.PgBack } },
         ShowNextImage = { { Device.input.group.PgFwd } },
     }
-
-    logger.dbg("Key events registered successfully")
 end
 
 
@@ -426,19 +421,13 @@ function KamareImageViewer:loadSettings()
         else
             self.prefetch_pages = 1
         end
-
-        logger.dbg("Loaded Kamare settings from file")
     else
-        logger.dbg("No Kamare settings available - using defaults")
         self.prefetch_pages = 1
     end
 
     -- Keep config fields in sync so ConfigDialog reflects current state
     self.configurable.footer_mode = self.footer_settings.mode
     self.configurable.prefetch_pages = self.prefetch_pages
-    logger.dbg("Final configurable.footer_mode:", self.configurable.footer_mode)
-    logger.dbg("Final footer_settings.mode:", self.footer_settings.mode)
-    logger.dbg("Final prefetch_pages:", self.prefetch_pages)
 end
 
 function KamareImageViewer:syncAndSaveSettings()
@@ -452,7 +441,6 @@ function KamareImageViewer:saveSettings()
     if kamare_settings then
         self.configurable:saveSettings(kamare_settings, self.options.prefix.."_")
         kamare_settings:flush()
-        logger.dbg("Saved Kamare settings to file")
     end
 end
 
@@ -463,7 +451,6 @@ end
 function KamareImageViewer:isValidMode(mode)
     mode = tonumber(mode)
     if not mode then
-        logger.dbg("Invalid mode (not a number):", tostring(mode))
         return false
     end
     if mode == self.MODE.off then
@@ -472,43 +459,31 @@ function KamareImageViewer:isValidMode(mode)
 
     local mode_name = self.mode_index[mode]
     if not mode_name then
-        logger.dbg("Invalid mode index:", mode)
         return false
     end
 
     local is_enabled = self.footer_settings[mode_name]
-    logger.dbg("Mode", mode, "(", mode_name, ") is", is_enabled and "enabled" or "disabled")
     return is_enabled
 end
 
 function KamareImageViewer:cycleToNextValidMode()
-    local old_mode = self.footer_settings.mode
     local max_modes = #self.mode_index
     local attempts = 0
 
     self.footer_settings.mode = (self.footer_settings.mode % max_modes) + 1
 
     while attempts < max_modes do
-        logger.dbg("Checking mode", self.footer_settings.mode)
-
         if self:isValidMode(self.footer_settings.mode) then
-            local mode_name = self.mode_index[self.footer_settings.mode] or "off"
-            logger.dbg("Found valid mode:", mode_name)
             break
         else
             self.footer_settings.mode = (self.footer_settings.mode % max_modes) + 1
-            logger.dbg("Skipping invalid mode, trying next")
         end
         attempts = attempts + 1
     end
 
     if attempts >= max_modes then
-        logger.dbg("No valid modes found, defaulting to off")
         self.footer_settings.mode = self.MODE.off
     end
-
-    local mode_name = self.mode_index[self.footer_settings.mode] or "off"
-    logger.dbg("Mode cycled from", old_mode, "to", self.footer_settings.mode, "(", mode_name, ")")
 
     self:syncAndSaveSettings()
     self:applyFooterMode()
@@ -528,9 +503,6 @@ function KamareImageViewer:setFooterMode(new_mode)
     end
 
     self.footer_settings.mode = tonumber(new_mode) or self.footer_settings.mode
-
-    local mode_name = self.mode_index[new_mode] or "off"
-    logger.dbg("Set footer mode to:", new_mode, "name:", mode_name)
 
     self:syncAndSaveSettings()
     self:applyFooterMode()
@@ -622,17 +594,8 @@ function KamareImageViewer:initConfigGesListener()
 end
 
 function KamareImageViewer:onShowConfigMenu()
-    logger.dbg("Showing Kamare config menu")
-
     self.configurable.footer_mode = self.footer_settings.mode
     self.configurable.prefetch_pages = self.prefetch_pages
-    logger.dbg("Before showing config dialog - configurable.footer_mode:", self.configurable.footer_mode)
-    logger.dbg("Before showing config dialog - footer_settings.mode:", self.footer_settings.mode)
-
-    logger.dbg("Configurable object contents:")
-    for k, v in pairs(self.configurable) do
-        logger.dbg("  ", k, "=", v)
-    end
 
     self.config_dialog = ConfigDialog:new{
         document = nil,
@@ -656,9 +619,7 @@ function KamareImageViewer:onConfigCloseCallback()
 
     local footer_mode = self.configurable.footer_mode
     if footer_mode and footer_mode ~= self.footer_settings.mode then
-        if self:setFooterMode(footer_mode) then
-            self:applyFooterMode()
-        end
+        self:setFooterMode(footer_mode)
     end
 
     self:syncAndSaveSettings()
@@ -672,16 +633,9 @@ end
 
 function KamareImageViewer:onSetFooterMode(...)
     local args = {...}
-    logger.dbg("onSetFooterMode called with", #args, "arguments:")
-    for i, arg in ipairs(args) do
-        logger.dbg("  arg[" .. i .. "] =", arg, "(" .. type(arg) .. ")")
-    end
-
     local mode = tonumber(args[1])
-    logger.dbg("onSetFooterMode called with mode:", mode)
 
     if self:setFooterMode(mode) then
-        logger.dbg("Footer mode updated to:", mode)
         return true
     end
 
@@ -691,7 +645,6 @@ end
 function KamareImageViewer:onSetPrefetchPages(...)
     local args = {...}
     local value = args[1]
-    logger.dbg("onSetPrefetchPages called with value:", value)
     local n = tonumber(value)
     if not n then
         logger.warn("onSetPrefetchPages: invalid value:", value)
@@ -706,7 +659,6 @@ function KamareImageViewer:onSetPrefetchPages(...)
 
     self.prefetch_pages = n
     self.configurable.prefetch_pages = n
-    logger.dbg("Prefetch pages set to:", n)
 
     self:syncAndSaveSettings()
 
@@ -719,7 +671,6 @@ end
 function KamareImageViewer:onDefineZoom(...)
     local args = {...}
     local v = tonumber(args[1])
-    logger.dbg("onDefineZoom called with value:", v)
     if v ~= nil then
         self.configurable.zoom_mode_type = v
         self:saveSettings()
@@ -729,25 +680,20 @@ function KamareImageViewer:onDefineZoom(...)
 end
 
 function KamareImageViewer:onTapMenu()
-    logger.dbg("Menu zone tap - toggling title bar")
     self:toggleTitleBar()
     return true
 end
 
 function KamareImageViewer:onTapConfig()
-    logger.dbg("Config zone tap - showing config menu")
     return self:onShowConfigMenu()
 end
 
 function KamareImageViewer:onTapMinibar()
-    logger.dbg("Minibar zone tap - cycling footer mode")
     if not self.footer_settings.enabled or not self.virtual_document or self._images_list_nb <= 1 then
-        logger.dbg("Footer not available for minibar tap")
         return false
     end
 
     if self.footer_settings.lock_tap then
-        logger.dbg("Footer tap locked - opening config menu instead")
         return self:onShowConfigMenu()
     end
 
@@ -756,26 +702,18 @@ function KamareImageViewer:onTapMinibar()
 end
 
 function KamareImageViewer:onTapForward()
-    logger.dbg("Forward zone tap")
-
     if BD.mirroredUILayout() then
-        logger.dbg("Mirrored layout - going to previous image")
         self:onShowPrevImage()
     else
-        logger.dbg("Normal layout - going to next image")
         self:onShowNextImage()
     end
     return true
 end
 
 function KamareImageViewer:onTapBackward()
-    logger.dbg("Backward zone tap")
-
     if BD.mirroredUILayout() then
-        logger.dbg("Mirrored layout - going to next image")
         self:onShowNextImage()
     else
-        logger.dbg("Normal layout - going to previous image")
         self:onShowPrevImage()
     end
     return true
@@ -808,8 +746,6 @@ function KamareImageViewer:setupTitleBar()
         end,
         show_parent = self,
     }
-
-    logger.dbg("TitleBar created successfully with title:", title, "subtitle:", subtitle)
 end
 
 function KamareImageViewer:setupFooter()
@@ -866,46 +802,36 @@ function KamareImageViewer:setupFooter()
     }
     self.footer = self.footer_content
 
-    logger.dbg("Screen dimensions:", Screen:getWidth(), Screen:getHeight())
-    logger.dbg("Footer created with initial dimen:", self.footer.dimen.x, self.footer.dimen.y, self.footer.dimen.w, self.footer.dimen.h)
-
     self:refreshFooter()
 end
 
 function KamareImageViewer:updateFooterTextGenerator()
-    logger.dbg("updateFooterTextGenerator called")
     if not self.footer_settings.enabled then
-        logger.dbg("Footer disabled, setting empty generator")
         self.genFooterText = self.footerTextGeneratorMap.empty
         return
     end
 
     if not self:isValidMode(self.footer_settings.mode) then
-        logger.dbg("Current mode not valid, setting empty generator")
         self.genFooterText = self.footerTextGeneratorMap.empty
         return
     end
 
     local mode_name = self.mode_index[self.footer_settings.mode]
-    logger.dbg("Setting generator for mode:", mode_name)
     self.genFooterText = self.footerTextGeneratorMap[mode_name] or self.footerTextGeneratorMap.empty
 end
 
 function KamareImageViewer:updateFooterContent()
     if not self.footer_text then
-        logger.dbg("updateFooterContent - no footer_text widget")
         return
     end
 
     if not self.genFooterText then
-        logger.dbg("updateFooterContent - no text generator, setting empty")
         self.genFooterText = self.footerTextGeneratorMap.empty
         self:updateFooterTextGenerator()
     end
 
     local new_font_face = Font:getFace("ffont", self.footer_settings.text_font_size)
     if new_font_face ~= self.footer_text_face then
-        logger.dbg("updateFooterContent - font changed, updating")
         self.footer_text_face = new_font_face
         local current_text = self.footer_text.text
         self.footer_text:free()
@@ -916,7 +842,6 @@ function KamareImageViewer:updateFooterContent()
         }
         self.footer_text_container[1] = self.footer_text
     elseif self.footer_settings.text_font_bold ~= self.footer_text.bold then
-        logger.dbg("updateFooterContent - bold changed, updating")
         local current_text = self.footer_text.text
         self.footer_text:free()
         self.footer_text = TextWidget:new{
@@ -928,7 +853,6 @@ function KamareImageViewer:updateFooterContent()
     end
 
     local text = self.genFooterText()
-    logger.dbg("updateFooterContent - generated text:", text)
     self.footer_text:setText(text)
 
     local margins_width = 2 * Screen:scaleBySize(self.footer_settings.progress_margin_width)
@@ -951,6 +875,7 @@ function KamareImageViewer:updateFooterContent()
             Screen:getWidth() - margins_width - text_container_width)
     end
 
+    self.footer_left_margin_span.width = Screen:scaleBySize(self.footer_settings.progress_margin_width)
     self.footer_right_margin_span.width = Screen:scaleBySize(self.footer_settings.progress_margin_width)
 
     self.footer_horizontal_group:resetLayout()
@@ -1002,7 +927,7 @@ function KamareImageViewer:getTimeEstimate(remaining_images)
     end
 end
 
-function KamareImageViewer:switchToImageNum(image_num)
+function KamareImageViewer:recordViewingTimeIfValid()
     if self.current_image_start_time and self._images_list_cur then
         local viewing_time = os.time() - self.current_image_start_time
         if viewing_time > 0 and viewing_time < 300 then
@@ -1012,6 +937,10 @@ function KamareImageViewer:switchToImageNum(image_num)
             end
         end
     end
+end
+
+function KamareImageViewer:switchToImageNum(image_num)
+    self:recordViewingTimeIfValid()
 
     if image_num == self._images_list_cur then
         return
@@ -1023,7 +952,8 @@ function KamareImageViewer:switchToImageNum(image_num)
     self.scale_factor = 0 -- Reset to fit-to-screen so the complete image is visible
     self.current_image_start_time = os.time()
 
-    self:update()
+    self:updateImageOnly()
+    self:refreshFooter()
     self:_postViewProgress()
     UIManager:nextTick(function()
         self:prefetchUpcomingTiles()
@@ -1043,20 +973,21 @@ function KamareImageViewer:onShowPrevImage()
 end
 
 function KamareImageViewer:applyFooterMode()
+    local prev_visible = self.footer_visible
     self.footer_visible = (self.footer_settings.mode ~= self.MODE.off)
-    logger.dbg("applyFooterMode - visible:", self.footer_visible)
 
     self:updateFooterTextGenerator()
-    self:update()
-    self:refreshFooter()
+    if self.footer_visible ~= prev_visible then
+        self:update()
+    else
+        self:refreshFooter()
+    end
 end
 
 function KamareImageViewer:toggleTitleBar()
     self.title_bar_visible = not self.title_bar_visible
-    logger.dbg("Title bar visibility toggled to:", self.title_bar_visible)
 
     if not self.title_bar then
-        logger.dbg("Title bar not created, creating now")
         self:setupTitleBar()
     end
 
@@ -1104,17 +1035,45 @@ function KamareImageViewer:update()
 end
 
 -- Prefetch the next N pages' full tiles (fit-to-screen) into DocCache.
+function KamareImageViewer:updateImageOnly()
+    if not (self.image_container and self.frame_elements) then
+        return self:update()
+    end
+
+    local old_container = self.image_container
+    local old_wg = self._image_wg
+
+    self:_new_image_wg()
+    local new_container = self.image_container
+
+    local replaced = false
+    for i = 1, #self.frame_elements do
+        if self.frame_elements[i] == old_container then
+            self.frame_elements[i] = new_container
+            replaced = true
+            break
+        end
+    end
+    if not replaced then
+        table.insert(self.frame_elements, new_container)
+    end
+
+    if old_wg then pcall(function() old_wg:free() end) end
+    if old_container then pcall(function() old_container:free() end) end
+
+    self.frame_elements:resetLayout()
+
+    UIManager:setDirty(self, "partial", new_container.dimen)
+end
+
 function KamareImageViewer:prefetchUpcomingTiles()
     if not self.virtual_document then return end
     local count = tonumber(self.prefetch_pages) or 0
     if count <= 0 then return end
 
-    local max_w = self.width
-    local max_h = self.img_container_h
-    if self.footer_visible or self.title_bar_visible then
-        max_w = max_w - self.image_padding*2
-        max_h = max_h - self.image_padding*2
-    end
+    -- Base size ignoring chrome so prefetch renders at full-screen zoom
+    local base_w = self.width - self.image_padding*2
+    local base_h = self.height - self.image_padding*2
 
     local rotation_angle = self:_getRotationAngle()
     local gamma = 1.0
@@ -1125,6 +1084,8 @@ function KamareImageViewer:prefetchUpcomingTiles()
 
         UIManager:nextTick(function()
             pcall(function()
+                -- Ensure MuPDF dims are resolved before computing zoom policy
+                self.virtual_document:ensureDims(page)
                 local dims = self.virtual_document:getNativePageDimensions(page)
                 if not dims or dims.w <= 0 or dims.h <= 0 then return end
 
@@ -1134,13 +1095,24 @@ function KamareImageViewer:prefetchUpcomingTiles()
                 end
                 if w0 <= 0 or h0 <= 0 then return end
 
-                local zoom = math.min(max_w / w0, max_h / h0)
-                if not (zoom and zoom > 0) then
-                    zoom = self._scale_factor_0 or 1.0
-                end
+                local zoom_w = base_w / w0
+                local zoom_h = base_h / h0
+                local view_aspect = base_w / base_h
+                local page_aspect = w0 / h0
+                local is_wide = page_aspect > (view_aspect + 0.01)
 
-                -- Full-page prefetch (persistent tile)
-                self.virtual_document:prefetchPage(page, zoom, rotation_angle, gamma)
+                if is_wide then
+                    -- Match on-screen policy: prefetch full page at fit-to-width
+                    local zoom = zoom_w
+                    self.virtual_document:prefetchPage(page, zoom, rotation_angle, gamma)
+                else
+                    -- Full-page prefetch (persistent tile) at fit-inside zoom
+                    local zoom = math.min(zoom_w, zoom_h)
+                    if not (zoom and zoom > 0) then
+                        zoom = self._scale_factor_0 or 1.0
+                    end
+                    self.virtual_document:prefetchPage(page, zoom, rotation_angle, gamma)
+                end
             end)
         end)
     end
@@ -1162,7 +1134,6 @@ end
 
 function KamareImageViewer:_clean_image_wg()
     if self._image_wg then
-        logger.dbg("KamareImageViewer:_clean_image_wg")
         self._image_wg:free()
         self._image_wg = nil
     end
@@ -1183,6 +1154,14 @@ end
 -- Helper to clamp a value between bounds
 local function clamp(v, lo, hi)
     return math.max(lo, math.min(v, hi))
+end
+
+function KamareImageViewer:_effectiveZoom()
+    if self.scale_factor == 0 then
+        return self._scale_factor_0 or (self._image_wg and self._image_wg.getScaleFactor and self._image_wg:getScaleFactor()) or 1.0
+    else
+        return self.scale_factor
+    end
 end
 
 -- Compute device-space (after zoom/rotation) viewport of size vw x vh centered on current center ratios
@@ -1210,11 +1189,16 @@ function KamareImageViewer:_new_image_wg()
         max_image_w = self.width - self.image_padding*2
     end
 
+    -- Compute a base size ignoring chrome (titlebar/footer) so the render zoom stays stable across toggles.
+    local base_image_w = self.width - self.image_padding*2
+    local base_image_h = self.height - self.image_padding*2
+
     local rotation_angle = self:_getRotationAngle()
     local current_page_num = self._images_list_cur
     local current_gamma = 1.0 -- Assuming no gamma control in KamareImageViewer directly
 
     -- Get native dimensions of the current image
+    self.virtual_document:ensureDims(current_page_num)
     local native_dims = self.virtual_document:getNativePageDimensions(current_page_num)
     if not native_dims or native_dims.w == 0 or native_dims.h == 0 then
         logger.warn("KamareImageViewer: Could not get native dimensions for page", current_page_num)
@@ -1233,14 +1217,15 @@ function KamareImageViewer:_new_image_wg()
     end
 
     local current_zoom = self.scale_factor
+    local zoom_w, zoom_h
     if current_zoom == 0 then -- Fit to screen (account for rotation)
         local w0, h0 = native_dims.w, native_dims.h
         if rotation_angle == 90 or rotation_angle == 270 then
             w0, h0 = h0, w0
         end
-        local scale_w = max_image_w / w0
-        local scale_h = max_image_h / h0
-        current_zoom = math.min(scale_w, scale_h)
+        zoom_w = base_image_w / w0
+        zoom_h = base_image_h / h0
+        current_zoom = math.min(zoom_w, zoom_h)
         self._scale_factor_0 = current_zoom -- Cache for zoom in/out
     end
 
@@ -1250,18 +1235,92 @@ function KamareImageViewer:_new_image_wg()
     local tile
     local widget_w, widget_h, widget_scale
     if self.scale_factor == 0 then
-        -- Full page render
-        tile = self.virtual_document:renderPage(
-            current_page_num,
-            nil,
-            current_zoom,
-            rotation_angle,
-            current_gamma
-        )
-        -- Let the widget auto-fit this full page tile into the container.
-        widget_w = max_image_w
-        widget_h = max_image_h
-        widget_scale = 0
+        -- Dynamic wide check from MuPDF dims (after rotation)
+        local w0, h0 = native_dims.w, native_dims.h
+        if rotation_angle == 90 or rotation_angle == 270 then
+            w0, h0 = h0, w0
+        end
+        local page_aspect = w0 / h0
+        local view_aspect = base_image_w / base_image_h
+        local is_wide = page_aspect > (view_aspect + 0.01)
+        if is_wide then
+            -- Fit-by-width for wide pages: render full page at zoom_w
+            current_zoom = zoom_w or current_zoom
+            self._scale_factor_0 = current_zoom
+
+            tile = self.virtual_document:renderPage(
+                current_page_num,
+                nil,
+                current_zoom,
+                rotation_angle,
+                current_gamma
+            )
+
+            -- After first render (or cache hit), native dims may have been corrected.
+            -- Recompute fit-by-width zoom and re-render if it changed meaningfully.
+            do
+                local dims_now = self.virtual_document:getNativePageDimensions(current_page_num)
+                if dims_now and dims_now.w > 0 and dims_now.h > 0 then
+                    local w0, h0 = dims_now.w, dims_now.h
+                    if rotation_angle == 90 or rotation_angle == 270 then
+                        w0, h0 = h0, w0
+                    end
+                    local zoom_w2 = base_image_w / w0
+                    if math.abs(zoom_w2 - current_zoom) > 0.02 then
+                        tile = self.virtual_document:renderPage(
+                            current_page_num,
+                            nil,
+                            zoom_w2,
+                            rotation_angle,
+                            current_gamma
+                        )
+                        self._scale_factor_0 = zoom_w2
+                        current_zoom = zoom_w2
+                    end
+                end
+            end
+
+            -- Full-page tile; display 1:1
+            widget_w = max_image_w
+            widget_h = max_image_h
+            widget_scale = 0
+        else
+            -- Regular: full page render at min zoom
+            tile = self.virtual_document:renderPage(
+                current_page_num,
+                nil,
+                current_zoom,
+                rotation_angle,
+                current_gamma
+            )
+            -- After first render, MuPDF dims are cached; recompute fit once and re-render if needed
+            do
+                local dims_now = self.virtual_document:getNativePageDimensions(current_page_num)
+                if dims_now and dims_now.w > 0 and dims_now.h > 0 then
+                    local w0, h0 = dims_now.w, dims_now.h
+                    if rotation_angle == 90 or rotation_angle == 270 then
+                        w0, h0 = h0, w0
+                    end
+                    local zoom_w2 = base_image_w / w0
+                    local zoom_h2 = base_image_h / h0
+                    local fit_zoom2 = math.min(zoom_w2, zoom_h2)
+                    if math.abs(fit_zoom2 - current_zoom) > 0.02 then
+                        tile = self.virtual_document:renderPage(
+                            current_page_num,
+                            nil,
+                            fit_zoom2,
+                            rotation_angle,
+                            current_gamma
+                        )
+                        self._scale_factor_0 = fit_zoom2
+                        current_zoom = fit_zoom2
+                    end
+                end
+            end
+            widget_w = max_image_w
+            widget_h = max_image_h
+            widget_scale = 0
+        end
     else
         -- Compute viewport in device space for current zoom/rotation and container size
         local _, viewport = self:_computeViewport(native_dims, current_zoom, rotation_angle, max_image_w, max_image_h)
@@ -1288,11 +1347,13 @@ function KamareImageViewer:_new_image_wg()
     end
 
     if tile and tile.bb then
+        -- If we rendered a full-page tile (widget_scale == 0), display it 1:1 to avoid a second fit in ImageWidget.
+        local w, h, sf = widget_w, widget_h, widget_scale
         self._image_wg = BlitBufferWidget:new{
             blitbuffer = tile.bb,
-            width = widget_w,
-            height = widget_h,
-            scale_factor = widget_scale, -- 0: fit full page; 1: 1:1 for cropped viewport
+            width = w,
+            height = h,
+            scale_factor = sf, -- 0: fit full page; 1: 1:1 for cropped viewport (and full-page tiles we pre-fit)
             center_x_ratio = 0.5,
             center_y_ratio = 0.5,
         }
@@ -1383,15 +1444,7 @@ function KamareImageViewer:_applyNewScaleFactor(new_factor)
 
     if new_factor ~= self.scale_factor then
         self.scale_factor = new_factor
-        self:update()
-    else
-        if self.scale_factor == min_scale_factor then
-            logger.dbg("ImageViewer: Hit the min scaling factor:", self.scale_factor)
-        elseif self.scale_factor == max_scale_factor then
-            logger.dbg("ImageViewer: Hit the max scaling factor:", self.scale_factor)
-        else
-            logger.dbg("ImageViewer: No change in scaling factor:", self.scale_factor)
-        end
+        self:updateImageOnly()
     end
 end
 
@@ -1429,8 +1482,9 @@ function KamareImageViewer:onSpread(_, ges)
     local native_dims = self.virtual_document:getNativePageDimensions(current_page_num)
     if not native_dims then return end
 
-    local current_rendered_w = native_dims.w * self.scale_factor
-    local current_rendered_h = native_dims.h * self.scale_factor
+    local eff = self:_effectiveZoom()
+    local current_rendered_w = native_dims.w * eff
+    local current_rendered_h = native_dims.h * eff
 
     if ges.direction == "vertical" then
         local img_h = current_rendered_h
@@ -1458,8 +1512,9 @@ function KamareImageViewer:onPinch(_, ges)
     local native_dims = self.virtual_document:getNativePageDimensions(current_page_num)
     if not native_dims then return end
 
-    local current_rendered_w = native_dims.w * self.scale_factor
-    local current_rendered_h = native_dims.h * self.scale_factor
+    local eff = self:_effectiveZoom()
+    local current_rendered_w = native_dims.w * eff
+    local current_rendered_h = native_dims.h * eff
 
     if ges.direction == "vertical" then
         local img_h = current_rendered_h
@@ -1500,7 +1555,7 @@ function KamareImageViewer:panBy(x, y)
     self._center_x_ratio = (viewport.x + viewport.w / 2) / page_size.w
     self._center_y_ratio = (viewport.y + viewport.h / 2) / page_size.h
 
-    self:update()
+    self:updateImageOnly()
 end
 
 function KamareImageViewer:onSwipe(_, ges)
@@ -1512,7 +1567,8 @@ function KamareImageViewer:onSwipe(_, ges)
     local current_page_num = self._images_list_cur
     local native_dims = self.virtual_document:getNativePageDimensions(current_page_num)
     if not native_dims then return end
-    local current_rendered_h = native_dims.h * self.scale_factor
+    local eff = self:_effectiveZoom()
+    local current_rendered_h = native_dims.h * eff
 
     if direction == "north" then
         if ges.pos.x < Screen:getWidth() * 1/8 or ges.pos.x > Screen:getWidth() * 7/8 then
@@ -1594,21 +1650,11 @@ function KamareImageViewer:onClose()
 
     if self.title_bar_visible and self.title_bar then
         self.title_bar_visible = false
-        logger.dbg("Title bar hidden on viewer close")
     end
 
-    if self.current_image_start_time and self._images_list_cur then
-        local viewing_time = os.time() - self.current_image_start_time
-        if viewing_time > 0 and viewing_time < 300 then
-            table.insert(self.image_viewing_times, viewing_time)
-            if #self.image_viewing_times > 10 then
-                table.remove(self.image_viewing_times, 1)
-            end
-        end
-    end
+    self:recordViewingTimeIfValid()
 
     if self.on_close_callback then
-        logger.dbg("KamareImageViewer: calling on_close_callback")
         self.on_close_callback(self._images_list_cur, self._images_list_nb)
     end
 
