@@ -947,8 +947,7 @@ function KamareImageViewer:prefetchUpcomingTiles()
         if page >= 1 and page <= (self._images_list_nb or 0) then
             UIManager:nextTick(function()
                 pcall(function()
-                    self.virtual_document:ensureDims(page)
-                    self.virtual_document:prefetchPage(page, zoom, self:_getRotationAngle(), 1.0)
+                    self.virtual_document:prefetchPage(page, zoom, self:_getRotationAngle())
                 end)
             end)
         end

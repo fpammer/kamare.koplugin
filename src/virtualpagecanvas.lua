@@ -409,10 +409,6 @@ function VirtualPageCanvas:paintSinglePage(target, x, y)
     end
     self:_ensureZoom()
     local page = Math.clamp(self.current_page or 1, 1, self.document:getPageCount())
-    if self.document.ensureDims then
-        pcall(function() self.document:ensureDims(page) end)
-    end
-
     local viewport_w, viewport_h = self:getViewportSize()
     if viewport_w <= 0 or viewport_h <= 0 then
         return
@@ -634,15 +630,9 @@ function VirtualPageCanvas:paintScroll(target, x, y, retry)
 
 
     local stacked_y = 0
-    for _, page_info in ipairs(visible_pages) do
-        if self.document.ensureDims then
-            pcall(function() self.document:ensureDims(page_info.page_num) end)
-        end
-    end
 
     if self.document and (self.document._virtual_layout_dirty or not self.document.virtual_layout) then
         self._layout_dirty = true
-        logger.warn("VPC:paintScroll layout dirty after ensureDims, retrying", "retry", retry)
         if retry < 1 then
             self:recalculateLayout()
             return self:paintScroll(target, x, y, retry + 1)
