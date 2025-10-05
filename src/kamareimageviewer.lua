@@ -57,7 +57,7 @@ local KamareImageViewer = InputContainer:extend{
     zoom_mode = 0, -- "full"
     _pending_scroll_page = nil,
 
-    scroll_step_ratio = 0.25,
+    scroll_distance = 25, -- percentage (25, 50, 75, 100)
 
     footer_settings = {
         enabled = true,
@@ -241,6 +241,7 @@ function KamareImageViewer:loadSettings()
     self.configurable.scroll_mode = self.scroll_mode and 1 or 0
     self.configurable.zoom_mode_type = self.zoom_mode
     self.configurable.page_gap_height = self.page_gap_height
+    self.configurable.scroll_distance = self.scroll_distance
 
     if settings then
         self.configurable:loadSettings(settings, self.options.prefix .. "_")
@@ -256,6 +257,7 @@ function KamareImageViewer:loadSettings()
     self.scroll_mode = (self.configurable.scroll_mode == 1)
     self.zoom_mode = self.configurable.zoom_mode_type
     self.page_gap_height = self.configurable.page_gap_height or 8
+    self.scroll_distance = self.configurable.scroll_distance or 25
 
     logger.info("KIV:loadSettings applied",
         "footer_mode", self.footer_settings.mode,
@@ -272,6 +274,7 @@ function KamareImageViewer:syncAndSaveSettings()
     self.configurable.scroll_mode = self.scroll_mode and 1 or 0
     self.configurable.zoom_mode_type = self.zoom_mode
     self.configurable.page_gap_height = self.page_gap_height
+    self.configurable.scroll_distance = self.scroll_distance
 
     self:saveSettings()
 end
@@ -314,6 +317,9 @@ function KamareImageViewer:setZoomMode(mode)
 
         self:updateImageOnly()
         self:updateFooter()
+
+        -- Force screen refresh when changing zoom mode
+        UIManager:setDirty(self, "ui", self.main_frame.dimen)
 
         UIManager:nextTick(function()
             self:prefetchUpcomingTiles()
@@ -594,6 +600,7 @@ function KamareImageViewer:onShowConfigMenu()
     self.configurable.scroll_mode  = self.scroll_mode and 1 or 0
     self.configurable.zoom_mode_type = self.zoom_mode
     self.configurable.page_gap_height = self.page_gap_height
+    self.configurable.scroll_distance = self.scroll_distance
 
     self.config_dialog = ConfigDialog:new{
         document = nil,
@@ -625,8 +632,14 @@ function KamareImageViewer:onConfigCloseCallback()
             self._pending_scroll_page = self._images_list_cur
             if not self.scroll_mode then
                 self.scroll_offset = 0
+                -- Reset center position when switching to page mode
+                if self.canvas and self.zoom_mode == 0 then
+                    self.canvas:setCenter(0.5, 0.5)
+                end
             end
             self:update()
+            -- Force full screen refresh when switching modes
+            UIManager:setDirty(self, "ui", self.main_frame.dimen)
         end
     end
 
@@ -670,10 +683,16 @@ function KamareImageViewer:onSetScrollMode(value)
 
     if not self.scroll_mode then
         self.scroll_offset = 0
+        -- Reset center position when switching to page mode
+        if self.canvas and self.zoom_mode == 0 then
+            self.canvas:setCenter(0.5, 0.5)
+        end
     end
 
     self:syncAndSaveSettings()
     self:update()
+    -- Force full screen refresh when switching modes
+    UIManager:setDirty(self, "ui", self.main_frame.dimen)
 
     return true
 end
@@ -701,6 +720,19 @@ function KamareImageViewer:onPageGapUpdate(value)
         self:update()
         UIManager:nextTick(function() self:prefetchUpcomingTiles() end)
     end
+
+    return true
+end
+
+function KamareImageViewer:onScrollDistanceUpdate(value)
+    local distance = tonumber(value)
+    if not distance then return false end
+    distance = Math.clamp(distance, 0, 100)
+    if distance == self.scroll_distance then return true end
+
+    self.scroll_distance = distance
+    self.configurable.scroll_distance = distance
+    self:syncAndSaveSettings()
 
     return true
 end
@@ -742,7 +774,7 @@ function KamareImageViewer:_scrollStep(direction)
     end
 
     local zoom = self:getCurrentZoom()
-    local step_ratio = self.scroll_step_ratio or 0.25
+    local step_ratio = (self.scroll_distance or 25) / 100
     local step = math.max(viewport_h * step_ratio, 1)
     local total = self.virtual_document:getVirtualHeight(zoom, self:_getRotationAngle()) or 0
     local offset = self.scroll_offset or 0
@@ -851,7 +883,11 @@ function KamareImageViewer:_updateCanvasState()
         self:updateFooter()
     else
         self.scroll_offset = 0
-        self.canvas:setCenter(0.5, 0.5)
+        -- Only force center to 0.5, 0.5 for full-fit mode
+        -- For fit-width/fit-height, preserve current center position for panning
+        if self.zoom_mode == 0 then
+            self.canvas:setCenter(0.5, 0.5)
+        end
         self:updateFooter()
     end
 end
@@ -958,6 +994,141 @@ function KamareImageViewer:onSwipe(_, ges)
 end
 
 ------------------------------------------------------------------------
+--  Page-mode panning helpers
+------------------------------------------------------------------------
+
+function KamareImageViewer:_canPanInPageMode(direction)
+    -- Only applicable in page mode
+    if self.scroll_mode then return false end
+    if not (self.canvas and self.virtual_document) then return false end
+
+    local viewport_w, viewport_h = self.canvas:getViewportSize()
+    if viewport_w <= 0 or viewport_h <= 0 then return false end
+
+    local page = Math.clamp(self._images_list_cur or 1, 1, self._images_list_nb or 1)
+    local dims = self.virtual_document:getNativePageDimensions(page)
+    if not dims or dims.w <= 0 or dims.h <= 0 then return false end
+
+    local zoom = self:getCurrentZoom()
+    local rotation = self:_getRotationAngle()
+
+    -- Get effective page dimensions after rotation
+    local page_w = dims.w
+    local page_h = dims.h
+    if rotation % 180 ~= 0 then
+        page_w, page_h = page_h, page_w
+    end
+
+    -- Scale to current zoom
+    local scaled_w = page_w * zoom
+    local scaled_h = page_h * zoom
+
+    -- Check if panning is possible based on zoom mode
+    if self.zoom_mode == 1 then
+        -- Fit-width: can pan vertically if image height exceeds viewport
+        if scaled_h <= viewport_h then return false end
+
+        -- Calculate actual min/max boundaries (accounting for viewport clamping)
+        local min_y = viewport_h / (2 * scaled_h)
+        local max_y = 1.0 - min_y
+
+        local center_y = self.canvas.center_y_ratio or 0.5
+        if direction > 0 then
+            -- Moving down/next: check if we can move down
+            return center_y < max_y - 1e-3
+        else
+            -- Moving up/prev: check if we can move up
+            return center_y > min_y + 1e-3
+        end
+    elseif self.zoom_mode == 2 then
+        -- Fit-height: can pan horizontally if image width exceeds viewport
+        if scaled_w <= viewport_w then return false end
+
+        -- Calculate actual min/max boundaries (accounting for viewport clamping)
+        local min_x = viewport_w / (2 * scaled_w)
+        local max_x = 1.0 - min_x
+
+        local center_x = self.canvas.center_x_ratio or 0.5
+        if direction > 0 then
+            -- Moving right/next: check if we can move right
+            return center_x < max_x - 1e-3
+        else
+            -- Moving left/prev: check if we can move left
+            return center_x > min_x + 1e-3
+        end
+    end
+
+    return false
+end
+
+function KamareImageViewer:_panWithinPage(direction)
+    if not self.canvas then return false end
+
+    local viewport_w, viewport_h = self.canvas:getViewportSize()
+    if viewport_w <= 0 or viewport_h <= 0 then return false end
+
+    local page = Math.clamp(self._images_list_cur or 1, 1, self._images_list_nb or 1)
+    local dims = self.virtual_document:getNativePageDimensions(page)
+    if not dims or dims.w <= 0 or dims.h <= 0 then return false end
+
+    local zoom = self:getCurrentZoom()
+    local rotation = self:_getRotationAngle()
+    local page_w = dims.w
+    local page_h = dims.h
+    if rotation % 180 ~= 0 then
+        page_w, page_h = page_h, page_w
+    end
+
+    local step_ratio = (self.scroll_distance or 25) / 100
+
+    if self.zoom_mode == 1 then
+        -- Fit-width: pan vertically by viewport percentage
+        local scaled_h = page_h * zoom
+        if scaled_h <= viewport_h then return false end
+
+        -- Convert viewport-based step to center ratio change
+        local step_pixels = viewport_h * step_ratio
+        local center_ratio_step = step_pixels / scaled_h
+
+        local center_y = self.canvas.center_y_ratio or 0.5
+        local new_y = center_y + (direction > 0 and center_ratio_step or -center_ratio_step)
+        new_y = Math.clamp(new_y, 0.0, 1.0)
+
+        if math.abs(new_y - center_y) < 1e-6 then
+            return false
+        end
+
+        self.canvas:setCenter(self.canvas.center_x_ratio or 0.5, new_y)
+        self:updateImageOnly()
+        UIManager:setDirty(self, "partial", self.canvas.dimen)
+        return true
+    elseif self.zoom_mode == 2 then
+        -- Fit-height: pan horizontally by viewport percentage
+        local scaled_w = page_w * zoom
+        if scaled_w <= viewport_w then return false end
+
+        -- Convert viewport-based step to center ratio change
+        local step_pixels = viewport_w * step_ratio
+        local center_ratio_step = step_pixels / scaled_w
+
+        local center_x = self.canvas.center_x_ratio or 0.5
+        local new_x = center_x + (direction > 0 and center_ratio_step or -center_ratio_step)
+        new_x = Math.clamp(new_x, 0.0, 1.0)
+
+        if math.abs(new_x - center_x) < 1e-6 then
+            return false
+        end
+
+        self.canvas:setCenter(new_x, self.canvas.center_y_ratio or 0.5)
+        self:updateImageOnly()
+        UIManager:setDirty(self, "partial", self.canvas.dimen)
+        return true
+    end
+
+    return false
+end
+
+------------------------------------------------------------------------
 --  Page navigation & closing
 ------------------------------------------------------------------------
 
@@ -966,6 +1137,7 @@ function KamareImageViewer:switchToImageNum(page)
     page = Math.clamp(page, 1, self._images_list_nb)
     if page == self._images_list_cur then return end
 
+    local moving_forward = page > self._images_list_cur
     self._images_list_cur = page
     self.current_image_start_time = os.time()
 
@@ -973,6 +1145,48 @@ function KamareImageViewer:switchToImageNum(page)
         self:_scrollToPage(page)
     else
         self.scroll_offset = 0
+
+        -- Reset center position for page mode when switching pages
+        if self.canvas and (self.zoom_mode == 1 or self.zoom_mode == 2) then
+            local viewport_w, viewport_h = self.canvas:getViewportSize()
+            local dims = self.virtual_document:getNativePageDimensions(page)
+
+            if dims and viewport_w > 0 and viewport_h > 0 then
+                local zoom = self:getCurrentZoom()
+                local rotation = self:_getRotationAngle()
+                local page_w = dims.w
+                local page_h = dims.h
+                if rotation % 180 ~= 0 then
+                    page_w, page_h = page_h, page_w
+                end
+
+                if self.zoom_mode == 1 then
+                    -- Fit-width: horizontal centered, vertical at edge based on direction
+                    local scaled_h = page_h * zoom
+                    if scaled_h > viewport_h then
+                        -- Calculate minimum/maximum center positions that show actual content
+                        local min_y = viewport_h / (2 * scaled_h)
+                        local max_y = 1.0 - min_y
+                        local new_y = moving_forward and min_y or max_y
+                        self.canvas:setCenter(0.5, new_y)
+                    else
+                        self.canvas:setCenter(0.5, 0.5)
+                    end
+                elseif self.zoom_mode == 2 then
+                    -- Fit-height: vertical centered, horizontal at edge based on direction
+                    local scaled_w = page_w * zoom
+                    if scaled_w > viewport_w then
+                        -- Calculate minimum/maximum center positions that show actual content
+                        local min_x = viewport_w / (2 * scaled_w)
+                        local max_x = 1.0 - min_x
+                        local new_x = moving_forward and min_x or max_x
+                        self.canvas:setCenter(new_x, 0.5)
+                    else
+                        self.canvas:setCenter(0.5, 0.5)
+                    end
+                end
+            end
+        end
     end
 
     self:updateImageOnly()
@@ -985,6 +1199,14 @@ function KamareImageViewer:onShowNextImage()
     if self.scroll_mode and self:_scrollStep(1) then
         return
     end
+
+    -- In page mode, try to pan within current page first
+    if not self.scroll_mode and self:_canPanInPageMode(1) then
+        if self:_panWithinPage(1) then
+            return
+        end
+    end
+
     if self._images_list_cur < self._images_list_nb then
         self:switchToImageNum(self._images_list_cur + 1)
     end
@@ -994,6 +1216,14 @@ function KamareImageViewer:onShowPrevImage()
     if self.scroll_mode and self:_scrollStep(-1) then
         return
     end
+
+    -- In page mode, try to pan within current page first
+    if not self.scroll_mode and self:_canPanInPageMode(-1) then
+        if self:_panWithinPage(-1) then
+            return
+        end
+    end
+
     if self._images_list_cur > 1 then
         self:switchToImageNum(self._images_list_cur - 1)
     end

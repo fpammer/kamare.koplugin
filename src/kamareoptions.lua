@@ -39,6 +39,33 @@ local KamareOptions = {
                 },
             },
             {
+                name = "scroll_distance",
+                name_text = _("Scroll Distance"),
+                toggle = {"25%", "50%", "75%", "100%"},
+                values = {25, 50, 75, 100},
+                default_pos = 1,
+                default_value = 25,
+                event = "ScrollDistanceUpdate",
+                args = {25, 50, 75, 100},
+                enabled_func = function (configurable)
+                    return optionsutil.enableIfEquals(configurable, "scroll_mode", 1)
+                end,
+                name_text_hold_callback = optionsutil.showValues,
+                name_text_unit = true,
+                help_text = _([[In continuous view mode, sets the distance to scroll when using the up/down buttons.]]),
+                more_options = true,
+                more_options_param = {
+                    value_step = 1, value_hold_step = 10,
+                    value_min = 0, value_max = 100,
+                    precision = "%.1f",
+                },
+            }
+        }
+    },
+    {
+        icon = "appbar.pagefit",
+        options = {
+            {
                 name = "zoom_mode_type",
                 name_text = _("Fit"),
                 toggle = {_("full"), _("width"), _("height")},
