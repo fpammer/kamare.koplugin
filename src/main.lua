@@ -9,7 +9,6 @@ local _ = require("gettext")
 local Kamare = WidgetContainer:extend{
     name = "kamare",
     kamare_settings_file = DataStorage:getSettingsDir() .. "/kamare.lua",
-    settings = nil,
     servers = nil,
 }
 
@@ -26,7 +25,7 @@ end
 
 function Kamare:onDispatcherRegisterActions()
     Dispatcher:registerAction("kamare_show_catalog",
-        {category="none", event="ShowOPDSCatalog", title=_("Kavita Manga Reader"), filemanager=true,}
+        {category="none", event="ShowKavitaBrowser", title=_("Kavita Manga Reader"), filemanager=true,}
     )
 end
 
@@ -35,13 +34,13 @@ function Kamare:addToMainMenu(menu_items)
         text = _("Kavita Manga Reader"),
         sorting_hint = "search",
         callback = function()
-            self:onShowOPDSCatalog()
+            self:onShowKavitaBrowser()
         end,
     }
 end
 
-function Kamare:onShowOPDSCatalog()
-    self.opds_browser = KavitaBrowser:new{
+function Kamare:onShowKavitaBrowser()
+    self.browser = KavitaBrowser:new{
         servers = self.servers,
         title = _("Kavita Manga Reader"),
         is_popout = false,
@@ -49,11 +48,11 @@ function Kamare:onShowOPDSCatalog()
         title_bar_fm_style = true,
         _manager = self,
         close_callback = function()
-            UIManager:close(self.opds_browser)
+            UIManager:close(self.browser)
         end,
     }
 
-    UIManager:show(self.opds_browser)
+    UIManager:show(self.browser)
 end
 
 function Kamare:onFlushSettings()

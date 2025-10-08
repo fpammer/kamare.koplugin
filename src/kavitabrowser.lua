@@ -448,7 +448,9 @@ function KavitaBrowser:showSeriesDetail(series_name, series_id, library_id, opts
         table.insert(self.paths, { kavita_stream_root = self.current_stream_name, title = self.catalog_title })
     end
 
-    self:switchItemTable(self.catalog_title, items, nil, nil, self.catalog_author)
+    -- Pass -1 to maintain current page when refreshing, nil to reset to page 1
+    local itemnumber = refresh_only and -1 or nil
+    self:switchItemTable(self.catalog_title, items, itemnumber, nil, self.catalog_author)
     self:setTitleBarLeftIcon("appbar.menu")
     self.onLeftButtonTap = function()
         self:showTitleMenu()

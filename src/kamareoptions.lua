@@ -25,8 +25,8 @@ local KamareOptions = {
                 default_value = 8,
                 event = "PageGapUpdate",
                 args = {0, 2, 4, 8, 16, 32, 64},
-                show_func = function (configurable)
-                    return configurable.scroll_mode == 1
+                enabled_func = function (configurable)
+                    return optionsutil.enableIfEquals(configurable, "scroll_mode", 1)
                 end,
                 name_text_hold_callback = optionsutil.showValues,
                 name_text_unit = true,
@@ -47,8 +47,8 @@ local KamareOptions = {
                 default_value = 25,
                 event = "ScrollDistanceUpdate",
                 args = {25, 50, 75, 100},
-                show_func = function (configurable)
-                    return configurable.scroll_mode == 1
+                enabled_func = function (configurable)
+                    return optionsutil.enableIfEquals(configurable, "scroll_mode", 1)
                 end,
                 name_text_hold_callback = optionsutil.showValues,
                 name_text_unit = true,
@@ -84,8 +84,8 @@ local KamareOptions = {
                 default_value = 0,
                 event = "ScrollMarginUpdate",
                 args = {0, 10, 20, 30, 40, 60, 80, 100},
-                show_func = function (configurable)
-                    return configurable.scroll_mode == 1
+                enabled_func = function (configurable)
+                    return optionsutil.enableIfEquals(configurable, "scroll_mode", 1)
                 end,
                 name_text_hold_callback = optionsutil.showValues,
                 name_text_unit = true,
