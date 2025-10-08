@@ -923,6 +923,7 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name)
 
     local KamareImageViewer = require("kamareimageviewer")
     local viewer = KamareImageViewer:new{
+        ui = self.ui,
         images_list_data = images_list_data,
         title = metadata.seriesName or _("Manga"),
         fullscreen = true,

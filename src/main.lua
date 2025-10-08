@@ -46,6 +46,7 @@ end
 
 function Kamare:onShowKavitaBrowser()
     self.browser = KavitaBrowser:new{
+        ui = self.ui,
         servers = self.servers,
         title = _("Kavita Manga Reader"),
         is_popout = false,

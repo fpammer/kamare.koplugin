@@ -5,7 +5,7 @@ local logger = require("logger")
 local Blitbuffer = require("ffi/blitbuffer")
 local TileCacheItem = require("document/tilecacheitem")
 local mupdf = require("ffi/mupdf")
-local LRUCache = require("lrucache")
+local VIDCache = require("virtualimagedocumentcache")
 
 -- Default dimensions for pages when dimensions cannot be determined
 local DEFAULT_PAGE_WIDTH = 800
@@ -38,10 +38,6 @@ local VirtualImageDocument = Document:extend{
     _virtual_layout_dirty = true,
 
     tile_px = 1024, -- default tile size in page coords (px)
-
-    -- LRU caches
-    _native_tile_cache = nil,  -- For native resolution tiles
-    _scaled_tile_cache = nil,  -- For scaled tiles
 }
 
 local function isPositiveDimension(w, h)
@@ -104,35 +100,18 @@ function VirtualImageDocument:init()
     self.file = "virtualimage://" .. (self.cache_id or self.title or "session")
     self.mod_time = self.cache_mod_time or 0
 
-    -- Initialize LRU caches
-    self._native_tile_cache = LRUCache:new{
-        name = "VID-Native",
-        max_size = 128 * 1024 * 1024,  -- 128MB
-        on_evict = function(tile)
-            if tile and tile.bb and tile.bb.free then
-                tile.bb:free()
-                tile.bb = nil
-            end
-        end,
-    }
-
-    self._scaled_tile_cache = LRUCache:new{
-        name = "VID-Scaled",
-        max_size = 64 * 1024 * 1024,  -- 64MB
-        on_evict = function(tile)
-            if tile and tile.bb and tile.bb.free then
-                tile.bb:free()
-                tile.bb = nil
-            end
-        end,
-    }
-    self._scaled_cache_zoom = nil
-    self._scaled_cache_rotation = nil
-
     self.is_open = true
     self.info.has_pages = true
     self.info.number_of_pages = self._pages
     self.info.configurable = false
+
+    -- Add metadata for statistics compatibility
+    self.info.title = self.title or "Virtual Image Document"
+    self.info.authors = (self.metadata and self.metadata.author) or ""
+    self.info.series = (self.metadata and self.metadata.seriesName) or ""
+
+    -- Mark as non-picture document so statistics will track it
+    self.is_pic = false
 
     -- Invalidate old cached tiles (forces re-render with new zoom logic)
     self.tile_cache_validity_ts = os.time()
@@ -141,31 +120,16 @@ function VirtualImageDocument:init()
 end
 
 function VirtualImageDocument:clearCache()
-    -- Legacy function - now handled by LRU caches
-    if self._native_tile_cache then
-        self._native_tile_cache:clear()
-    end
-    if self._scaled_tile_cache then
-        self._scaled_tile_cache:clear()
-    end
+    -- Clear the singleton cache
+    VIDCache:clear()
 end
 
 function VirtualImageDocument:close()
-    -- Clear LRU caches before closing
-    if self._native_tile_cache then
-        self._native_tile_cache:clear()
-    end
-    if self._scaled_tile_cache then
-        self._scaled_tile_cache:clear()
-    end
-
     self.is_open = false
     self._dims_cache = nil
     self._virtual_layout_cache = nil
     self.virtual_layout = nil
     self.total_virtual_height = nil
-    self._native_tile_cache = nil
-    self._scaled_tile_cache = nil
     return true
 end
 
@@ -587,7 +551,7 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation)
     end
 
     -- Check native LRU cache first
-    local native_tile = self._native_tile_cache and self._native_tile_cache:get(hash)
+    local native_tile = VIDCache:getNativeTile(hash)
     if native_tile then
         -- Cached tile is at native resolution - scale to requested zoom before returning
         return self:_scaleToZoom(native_tile, zoom, rotation)
@@ -626,9 +590,7 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation)
     tile.size = tonumber(tile_bb.stride) * tile_bb.h + 512
 
     -- Cache the native resolution result
-    if self._native_tile_cache then
-        self._native_tile_cache:set(hash, tile, tile.size)
-    end
+    VIDCache:setNativeTile(hash, tile, tile.size)
 
     -- Scale to requested zoom before returning
     return self:_scaleToZoom(tile, zoom, rotation)
@@ -667,13 +629,7 @@ function VirtualImageDocument:_scaleToZoom(native_tile, zoom, rotation)
     end
 
     -- Check if zoom/rotation changed and clear scaled cache if needed
-    if self._scaled_tile_cache and self._scaled_cache_zoom ~= nil then
-        if math.abs(self._scaled_cache_zoom - zoom) > 0.001 or self._scaled_cache_rotation ~= rotation then
-            self._scaled_tile_cache:clear()
-        end
-    end
-    self._scaled_cache_zoom = zoom
-    self._scaled_cache_rotation = rotation
+    VIDCache:checkScaledCacheParams(zoom, rotation)
 
     -- Calculate target size at requested zoom
     local native_w = native_tile.bb:getWidth()
@@ -693,7 +649,7 @@ function VirtualImageDocument:_scaleToZoom(native_tile, zoom, rotation)
         h = native_h
     }
     local cache_key = self:_getScaledTileHash(native_tile.pageno, zoom, rotation, self.gamma, scaled_rect)
-    local cached = self._scaled_tile_cache and self._scaled_tile_cache:get(cache_key)
+    local cached = VIDCache:getScaledTile(cache_key)
     if cached and cached.bb then
         return cached
     end
@@ -728,9 +684,7 @@ function VirtualImageDocument:_scaleToZoom(native_tile, zoom, rotation)
     scaled_tile.size = tonumber(scaled_bb.stride) * scaled_bb.h + 512
 
     -- Add to LRU cache
-    if self._scaled_tile_cache then
-        self._scaled_tile_cache:set(cache_key, scaled_tile, scaled_tile.size)
-    end
+    VIDCache:setScaledTile(cache_key, scaled_tile, scaled_tile.size)
 
     return scaled_tile
 end
@@ -759,7 +713,7 @@ function VirtualImageDocument:_preSplitPageTiles(pageno, zoom, rotation, tile_px
     local missing = {}
     for _, t in ipairs(tiles) do
         local key = self:_tileHash(pageno, zoom, rotation, self.gamma, t)
-        local exists = self._native_tile_cache and self._native_tile_cache:get(key)
+        local exists = VIDCache:getNativeTile(key)
         if not (exists and exists.bb) then
             table.insert(missing, t)
         end
@@ -803,9 +757,7 @@ function VirtualImageDocument:_preSplitPageTiles(pageno, zoom, rotation, tile_px
 
             -- Cache with original requested rect for consistent lookup
             local key = self:_tileHash(pageno, zoom, rotation, self.gamma, t)
-            if self._native_tile_cache then
-                self._native_tile_cache:set(key, tile, tile.size)
-            end
+            VIDCache:setNativeTile(key, tile, tile.size)
         end
     end
 
@@ -872,7 +824,7 @@ function VirtualImageDocument:drawPageTiled(target, x, y, rect, pageno, zoom, ro
         local probe_tiles = self:_computeTileRects(prefetch_rect, tp)
         for _, t in ipairs(probe_tiles) do
             local key = self:_tileHash(pageno, zoom, rotation, self.gamma, t)
-            local hit = self._native_tile_cache and self._native_tile_cache:get(key)
+            local hit = VIDCache:getNativeTile(key)
             if not (hit and hit.bb) then
                 need_batch = true
                 break

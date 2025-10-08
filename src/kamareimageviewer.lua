@@ -1,6 +1,9 @@
 local BD = require("ui/bidi")
 local Device = require("device")
+local Event = require("ui/event")
 local KamareFooter = require("kamarefooter")
+local MD5 = require("ffi/sha2").md5
+local util = require("util")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local CenterContainer = require("ui/widget/container/centercontainer")
 local FrameContainer = require("ui/widget/container/framecontainer")
@@ -104,6 +107,7 @@ function KamareImageViewer:init()
 
     self:_initDocument()
     self:_initCanvas()
+    self:_setupStatisticsInterface()
 
     self.align = "center"
     self.region = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
@@ -143,6 +147,14 @@ function KamareImageViewer:init()
     UIManager:nextTick(function()
         self:prefetchUpcomingTiles()
         self:_postViewProgress()
+
+        -- Initialize statistics tracking using direct API
+        if self.ui and self.ui.statistics and self.doc_settings then
+            logger.info("KamareImageViewer: Calling statistics:onReaderReady")
+            self.ui.statistics:onReaderReady(self.doc_settings)
+        else
+            logger.dbg("KamareImageViewer: Statistics not initialized - ui.statistics:", self.ui and self.ui.statistics or "nil", "doc_settings:", self.doc_settings or "nil")
+        end
     end)
 end
 
@@ -198,6 +210,153 @@ function KamareImageViewer:_initCanvas()
     }
 
     self.image_container = self.canvas_container
+end
+
+function KamareImageViewer:_setupStatisticsInterface()
+    if not (self.ui and self.virtual_document) then
+        logger.dbg("KamareImageViewer: Statistics setup skipped - no ui or virtual_document")
+        return
+    end
+
+    if not self.ui.statistics then
+        logger.dbg("KamareImageViewer: Statistics plugin not available on ui")
+        return
+    end
+
+    logger.info("KamareImageViewer: Setting up statistics interface")
+
+    -- Create a wrapper that provides getCurrentPage() for statistics
+    -- This delegates to the viewer's state, not the document's state
+    local viewer_ref = self
+    local doc_wrapper = setmetatable({}, {
+        __index = function(t, k)
+            if k == "getCurrentPage" then
+                return function() return viewer_ref._images_list_cur end
+            else
+                return viewer_ref.virtual_document[k]
+            end
+        end
+    })
+
+    -- Set document reference on both self and self.ui
+    self.document = doc_wrapper
+    self.ui.document = doc_wrapper
+    -- Statistics plugin also needs document on its own instance
+    self.ui.statistics.document = doc_wrapper
+
+    -- Generate MD5 hash for this virtual document
+    -- Since virtual paths like "virtualimage://..." can't be opened as files,
+    -- we hash the virtual path directly instead of using util.partialMD5()
+    local partial_md5 = MD5(self.virtual_document.file)
+    logger.dbg("KamareImageViewer: Generated MD5 for", self.virtual_document.file, "=", partial_md5)
+
+    -- Create persistent stats storage
+    local stats_data = {
+        performance_in_pages = {},
+        title = self.metadata and self.metadata.localizedName or self.title or "Unknown",
+        authors = self.metadata and self.metadata.author or "",
+        series = self.metadata and self.metadata.seriesName or "",
+    }
+
+    -- Provide doc_settings stub for statistics compatibility
+    local doc_settings = {
+        readSetting = function(_, key, default)
+            if key == "summary" then
+                return { status = "reading", modified = os.date("%Y-%m-%d") }
+            elseif key == "percent_finished" then
+                return (viewer_ref._images_list_cur or 1) / (viewer_ref._images_list_nb or 1)
+            elseif key == "doc_pages" then
+                return viewer_ref._images_list_nb
+            elseif key == "doc_props" then
+                return viewer_ref.ui.doc_props
+            elseif key == "stats" then
+                -- Return persistent statistics data
+                return stats_data
+            elseif key == "partial_md5_checksum" then
+                return partial_md5
+            end
+            return default
+        end,
+        saveSetting = function(_, key, value)
+            logger.dbg("KamareImageViewer: doc_settings saveSetting", key, "=", value)
+        end,
+        isTrue = function(_, key) return false end,
+        nilOrFalse = function(_, key) return true end,
+    }
+
+    -- Set on both self and self.ui (statistics accesses via self.ui.doc_settings)
+    self.doc_settings = doc_settings
+    self.ui.doc_settings = doc_settings
+
+    -- Provide doc_props for statistics
+    local doc_props = {
+        title = self.metadata and self.metadata.localizedName or self.title or "Unknown",
+        display_title = self.metadata and self.metadata.localizedName or self.title or "Unknown",
+        authors = self.metadata and self.metadata.author or "",
+        series = self.metadata and self.metadata.seriesName or "",
+        series_index = self.metadata and self.metadata.volumeNumber or nil,
+        language = "N/A",
+        pages = self._images_list_nb,
+    }
+
+    logger.dbg("KamareImageViewer: doc_props =", doc_props.display_title, "pages:", doc_props.pages)
+
+    -- Set on both self and self.ui (statistics accesses via self.ui.doc_props)
+    self.doc_props = doc_props
+    self.ui.doc_props = doc_props
+
+    -- Provide annotation stub (returns 0 highlights and notes)
+    local annotation = {
+        getNumberOfHighlightsAndNotes = function()
+            return 0, 0
+        end
+    }
+
+    -- Set on both self and self.ui (statistics accesses via self.ui.annotation)
+    self.annotation = annotation
+    self.ui.annotation = annotation
+
+    -- Provide menu stub if not present
+    if not self.menu then
+        self.menu = {
+            registerToMainMenu = function() end
+        }
+    end
+
+    -- Ensure parent's dictionary module has required fields initialized
+    -- This prevents crashes during suspend/settings flush
+    if self.ui.dictionary then
+        -- Initialize fields that ReaderDictionary expects during onSaveSettings
+        if not self.ui.dictionary.preferred_dictionaries then
+            self.ui.dictionary.preferred_dictionaries = {}
+        end
+        if not self.ui.dictionary.doc_disabled_dicts then
+            self.ui.dictionary.doc_disabled_dicts = {}
+        end
+        self.dictionary = self.ui.dictionary
+    end
+
+    -- Provide view stub with footer
+    local view_stub = {
+        footer = {
+            maybeUpdateFooter = function()
+                if viewer_ref.footer then
+                    viewer_ref:updateFooter()
+                end
+            end
+        }
+    }
+
+    self.view = view_stub
+    -- Statistics plugin also needs view on its own instance
+    self.ui.statistics.view = view_stub
+
+    -- Use parent bookinfo if available
+    if not self.bookinfo and self.ui.bookinfo then
+        self.bookinfo = self.ui.bookinfo
+    end
+
+    logger.info("KamareImageViewer: Statistics interface setup complete")
 end
 
 function KamareImageViewer:_updateDimensions()
@@ -417,7 +576,8 @@ function KamareImageViewer:getFooterState()
         local total = self.virtual_document:getVirtualHeight(zoom, self:_getRotationAngle())
         local viewport_h = select(2, self.canvas:getViewportSize())
         if total > 0 then
-            local pos = (self.scroll_offset or 0) + viewport_h / 2
+            -- Use bottom of viewport for progress calculation so 100% is reached at the end
+            local pos = (self.scroll_offset or 0) + viewport_h
             scroll_progress = Math.clamp(pos / total, 0, 1)
         end
     end
@@ -608,7 +768,7 @@ function KamareImageViewer:onShowConfigMenu()
 
     self.config_dialog = ConfigDialog:new{
         document = nil,
-        ui = self.ui or self,
+        ui = self,  -- Always use self as ui, not parent ui
         configurable = self.configurable,
         config_options = self.options,
         is_always_active = true,
@@ -906,24 +1066,28 @@ end
 function KamareImageViewer:_updatePageFromScroll(silent)
     if not self.scroll_mode or not self.virtual_document then return end
     local zoom = self:getCurrentZoom()
-    local new_page = self.virtual_document:getPageAtOffset(self.scroll_offset or 0, zoom, self:_getRotationAngle())
+    -- Use viewport bottom for page detection so last page is reached when scrolled to the end
+    local viewport_h = self.canvas and select(2, self.canvas:getViewportSize()) or 0
+    local check_offset = (self.scroll_offset or 0) + viewport_h
+    local new_page = self.virtual_document:getPageAtOffset(check_offset, zoom, self:_getRotationAngle())
     if new_page ~= self._images_list_cur then
         if not silent then self:recordViewingTimeIfValid() end
         self._images_list_cur = new_page
         self.current_image_start_time = os.time()
         self:updateFooter()
         self:_postViewProgress()
+
+        -- Track page change in statistics using direct API
+        if self.ui and self.ui.statistics then
+            logger.dbg("KamareImageViewer: Page changed via scroll to", new_page)
+            self.ui.statistics:onPageUpdate(new_page)
+        end
+
         UIManager:nextTick(function() self:prefetchUpcomingTiles() end)
     elseif not silent then
         self:updateFooter()
         -- Check if we're at the bottom of the last page and need to post progress
-        if self._images_list_cur == self._images_list_nb then
-            local max_offset = self.canvas and self.canvas:getMaxScrollOffset() or 0
-            if max_offset > 0 and math.abs((self.scroll_offset or 0) - max_offset) < 1 then
-                -- We're at the bottom of the last page, ensure progress is posted
-                self:_postViewProgress()
-            end
-        end
+        self:_postViewProgress()
     end
 end
 
@@ -1237,6 +1401,12 @@ function KamareImageViewer:switchToImageNum(page)
     self._images_list_cur = page
     self.current_image_start_time = os.time()
 
+    -- Track page change in statistics using direct API
+    if self.ui and self.ui.statistics then
+        logger.dbg("KamareImageViewer: Page changed via switchToImageNum to", page)
+        self.ui.statistics:onPageUpdate(page)
+    end
+
     if self.scroll_mode then
         self:_scrollToPage(page)
     else
@@ -1347,7 +1517,19 @@ end
 
 function KamareImageViewer:_postViewProgress()
     if not (self.metadata and KavitaClient and KavitaClient.bearer) then return end
-    if self.last_posted_page == self._images_list_cur then return end
+
+    -- In scroll mode, also check if we're at the bottom of the last page
+    local at_end = false
+    if self.scroll_mode and self._images_list_cur == self._images_list_nb and self.canvas then
+        local max_offset = self.canvas:getMaxScrollOffset() or 0
+        if max_offset > 0 then
+            at_end = math.abs((self.scroll_offset or 0) - max_offset) < 1
+        end
+    end
+
+    -- Post if page changed OR if we're at the end of the last page
+    if self.last_posted_page == self._images_list_cur and not at_end then return end
+
     local page1 = self._images_list_cur
     UIManager:nextTick(function()
         pcall(function()
@@ -1362,6 +1544,21 @@ end
 ------------------------------------------------------------------------
 
 function KamareImageViewer:onClose()
+    -- Finalize statistics tracking using direct API
+    if self.ui and self.ui.statistics then
+        logger.info("KamareImageViewer: Calling statistics:onCloseDocument")
+        self.ui.statistics:onCloseDocument()
+
+        -- Clean up properties we set on self.ui to avoid interfering with FileManager
+        logger.dbg("KamareImageViewer: Cleaning up ui properties")
+        self.ui.doc_settings = nil
+        self.ui.doc_props = nil
+        self.ui.annotation = nil
+        self.ui.document = nil
+        self.ui.statistics.document = nil
+        self.ui.statistics.view = nil
+    end
+
     if self.config_dialog then
         self.config_dialog:closeDialog()
     end
