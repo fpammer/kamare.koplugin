@@ -13,11 +13,16 @@ local Kamare = WidgetContainer:extend{
 }
 
 function Kamare:init()
+    local logger = require("logger")
+
     self.kamare_settings = LuaSettings:open(self.kamare_settings_file)
+
     if next(self.kamare_settings.data) == nil then
         self.updated = true -- first run, force flush
+        logger.info("Kamare: first run, initializing settings")
     end
     self.servers = self.kamare_settings:readSetting("servers", {})
+
     -- Footer mode will be loaded by KamareImageViewer instances as needed
     self:onDispatcherRegisterActions()
     self.ui.menu:registerToMainMenu(self)
@@ -46,7 +51,7 @@ function Kamare:onShowKavitaBrowser()
         is_popout = false,
         is_borderless = true,
         title_bar_fm_style = true,
-        _manager = self,
+        kamare_settings = self.kamare_settings,
         close_callback = function()
             UIManager:close(self.browser)
         end,
@@ -55,11 +60,18 @@ function Kamare:onShowKavitaBrowser()
     UIManager:show(self.browser)
 end
 
+function Kamare:getSettings()
+    return self.kamare_settings
+end
+
+function Kamare:saveSettings()
+    self.kamare_settings:flush()
+    self.updated = nil
+end
+
 function Kamare:onFlushSettings()
-    if self.updated then
-        self.kamare_settings:flush()
-        self.updated = nil
-    end
+    -- Always flush to ensure settings persistence
+    self:saveSettings()
 end
 
 return Kamare

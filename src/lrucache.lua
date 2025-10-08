@@ -43,11 +43,9 @@ function LRUCache:get(key)
             -- Move to front (most recently used)
             table.remove(self.items, i)
             table.insert(self.items, 1, entry)
-            logger.dbg(self.name .. ":get hit", "key", key)
             return entry.value
         end
     end
-    logger.dbg(self.name .. ":get miss", "key", key)
     return nil
 end
 
@@ -84,7 +82,6 @@ function LRUCache:_evict(needed_size)
         end
 
         self.total_size = self.total_size - entry.size
-        logger.dbg(self.name .. ":evict", "key", entry.key, "size", entry.size, "remaining", self.total_size)
     end
 end
 
@@ -110,8 +107,6 @@ function LRUCache:set(key, value, size)
             -- Move to front
             table.remove(self.items, i)
             table.insert(self.items, 1, entry)
-
-            logger.dbg(self.name .. ":set update", "key", key, "size", size)
             return
         end
     end
@@ -126,8 +121,6 @@ function LRUCache:set(key, value, size)
         size = size,
     })
     self.total_size = self.total_size + size
-
-    logger.dbg(self.name .. ":set new", "key", key, "size", size, "total", self.total_size, "count", #self.items)
 end
 
 --[[
@@ -150,7 +143,6 @@ function LRUCache:remove(key)
             end
 
             self.total_size = self.total_size - entry.size
-            logger.dbg(self.name .. ":remove", "key", key, "size", entry.size)
             return true
         end
     end

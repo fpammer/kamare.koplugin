@@ -138,7 +138,6 @@ function VirtualImageDocument:init()
     self.tile_cache_validity_ts = os.time()
 
     self:updateColorRendering()
-    logger.info("VID:init complete", "pages", self._pages, "cache_ts", self.tile_cache_validity_ts)
 end
 
 function VirtualImageDocument:clearCache()
@@ -152,7 +151,6 @@ function VirtualImageDocument:clearCache()
 end
 
 function VirtualImageDocument:close()
-    logger.info("VID:close")
     -- Clear LRU caches before closing
     if self._native_tile_cache then
         self._native_tile_cache:clear()
@@ -202,7 +200,6 @@ function VirtualImageDocument:_ensureVirtualLayout(rotation)
     rotation = rotation or 0
     self._virtual_layout_cache = self._virtual_layout_cache or {}
     if self._virtual_layout_dirty then
-        logger.info("VID:_ensureVirtualLayout clearing cache", "rotation", rotation)
         self._virtual_layout_cache = {}
         self._virtual_layout_dirty = false
     end
@@ -212,11 +209,8 @@ function VirtualImageDocument:_ensureVirtualLayout(rotation)
     if entry then
         self.virtual_layout = entry.pages
         self.total_virtual_height = entry.rotated_total_height
-        logger.info("VID:_ensureVirtualLayout reuse", "cache_key", cache_key, "pages", self._pages, "total_h", entry.rotated_total_height, "max_w", entry.rotated_max_width)
         return entry
     end
-
-    logger.info("VID:_ensureVirtualLayout rebuild", "cache_key", cache_key, "pages", self._pages)
     entry = {
         rotation = rotation,
         pages = {},
@@ -266,8 +260,6 @@ function VirtualImageDocument:_ensureVirtualLayout(rotation)
     self._virtual_layout_cache[cache_key] = entry
     self.virtual_layout = entry.pages
     self.total_virtual_height = entry.rotated_total_height
-
-    logger.info("VID:_ensureVirtualLayout stats", "cache_key", cache_key, "pages", self._pages, "native_total_h", entry.native_total_height, "rotated_total_h", entry.rotated_total_height, "rotated_max_w", entry.rotated_max_width)
 
     return entry
 end
@@ -330,7 +322,6 @@ function VirtualImageDocument:preloadDimensions(list)
             self:_storeDims(pn, w, h)
         end
     end
-    logger.info("VID:preloadDimensions", "count", #list)
 end
 
 function VirtualImageDocument:validateDims(pageno)
@@ -361,7 +352,6 @@ function VirtualImageDocument:getPageBBox(pageno)
 end
 
 function VirtualImageDocument:_calculateVirtualLayout()
-    logger.info("VID:_calculateVirtualLayout invoking ensure layout")
     local entry = self:_ensureVirtualLayout(0)
     if entry then
         self.virtual_layout = entry.pages
@@ -420,10 +410,6 @@ function VirtualImageDocument:getVisiblePagesAtOffset(offset_y, viewport_height,
         end
     end
 
-    if #result == 0 then
-        logger.warn("VID:getVisiblePagesAtOffset empty", "offset", offset_y, "viewport", viewport_height, "zoom", zoom, "rotation", rotation, "entry_height", entry.rotated_total_height)
-    end
-
     return result
 end
 
@@ -441,7 +427,6 @@ function VirtualImageDocument:getScrollPositionForPage(pageno, zoom, rotation)
         return 0
     end
     local position = page.rotated_y_offset * zoom
-    logger.info("VID:getScrollPositionForPage", "page", pageno, "zoom", zoom, "rotation", rotation, "position", position)
     return position
 end
 
@@ -460,11 +445,9 @@ function VirtualImageDocument:getPageAtOffset(offset_y, zoom, rotation)
         local page_top = page.rotated_y_offset * zoom
         local page_bottom = page_top + page.rotated_height * zoom
         if offset_y >= page_top and offset_y < page_bottom then
-            logger.info("VID:getPageAtOffset", "offset", offset_y, "zoom", zoom, "rotation", rotation, "page", page.page_num)
             return page.page_num
         end
     end
-    logger.info("VID:getPageAtOffset defaulting to last page", "offset", offset_y, "zoom", zoom, "rotation", rotation, "last", entry.pages[#entry.pages].page_num)
     return entry.pages[#entry.pages].page_num
 end
 
@@ -686,7 +669,6 @@ function VirtualImageDocument:_scaleToZoom(native_tile, zoom, rotation)
     -- Check if zoom/rotation changed and clear scaled cache if needed
     if self._scaled_tile_cache and self._scaled_cache_zoom ~= nil then
         if math.abs(self._scaled_cache_zoom - zoom) > 0.001 or self._scaled_cache_rotation ~= rotation then
-            logger.info("VID:_scaleToZoom zoom/rotation changed, clearing scaled cache")
             self._scaled_tile_cache:clear()
         end
     end

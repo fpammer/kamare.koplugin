@@ -34,12 +34,10 @@ function VirtualPageCanvas:init()
         Widget.init(self)
     end
     self.dimen = Geom:new(self.dimen)
-    logger.info("VPC:init", "initial_dimen", self.dimen and self.dimen.w, self.dimen and self.dimen.h)
 end
 
 function VirtualPageCanvas:setDocument(doc)
     if self.document ~= doc then
-        logger.info("VPC:setDocument", "old", self.document ~= nil, "new", doc ~= nil)
         self.document = doc
         self._layout_dirty = true
         self:markDirty()
@@ -52,7 +50,6 @@ function VirtualPageCanvas:setMode(mode)
         return
     end
     if self.mode ~= mode then
-        logger.info("VPC:setMode", "from", self.mode, "to", mode)
         self.mode = mode
         self._layout_dirty = true
         self:markDirty()
@@ -62,7 +59,6 @@ end
 function VirtualPageCanvas:setPage(page)
     local new_page = tonumber(page) or self.current_page
     if new_page ~= self.current_page then
-        logger.info("VPC:setPage", "from", self.current_page, "to", new_page)
         self.current_page = new_page
         self._layout_dirty = true
         self:markDirty()
@@ -73,7 +69,6 @@ function VirtualPageCanvas:setZoom(zoom)
     zoom = tonumber(zoom) or self.zoom
     if zoom <= 0 then zoom = 1.0 end
     if math.abs(zoom - self.zoom) > 1e-6 then
-        logger.info("VPC:setZoom", "from", self.zoom, "to", zoom)
         self.zoom = zoom
         self._layout_dirty = true
         self:markDirty()
@@ -87,7 +82,6 @@ function VirtualPageCanvas:setZoomMode(mode)
         return
     end
     if self.zoom_mode ~= new_mode then
-        logger.info("VPC:setZoomMode", "from", self.zoom_mode, "to", new_mode)
         self.zoom_mode = new_mode
         self._layout_dirty = true
         self:markDirty()
@@ -98,7 +92,6 @@ function VirtualPageCanvas:setRotation(rotation)
     rotation = rotation or 0
     rotation = rotation % 360
     if self.rotation ~= rotation then
-        logger.info("VPC:setRotation", "from", self.rotation, "to", rotation)
         self.rotation = rotation
         self._layout_dirty = true
         self:markDirty()
@@ -110,7 +103,6 @@ function VirtualPageCanvas:setCenter(x_ratio, y_ratio)
     y_ratio = Math.clamp(tonumber(y_ratio) or self.center_y_ratio, 0, 1)
     if math.abs(self.center_x_ratio - x_ratio) > 1e-6
         or math.abs(self.center_y_ratio - y_ratio) > 1e-6 then
-        logger.info("VPC:setCenter", "from", self.center_x_ratio, self.center_y_ratio, "to", x_ratio, y_ratio)
         self.center_x_ratio = x_ratio
         self.center_y_ratio = y_ratio
         if self.mode == "page" then
@@ -132,19 +124,16 @@ function VirtualPageCanvas:setScrollOffset(offset)
     end
     local prev = self.scroll_offset or 0
     if math.abs(clamped - prev) > 0.5 then
-        logger.info("VPC:setScrollOffset", "mode", self.mode, "requested", requested, "clamped", clamped, "max", max_offset, "prev", prev)
         self.scroll_offset = clamped
         if self.mode == "scroll" then
             self:markDirty()
         end
-    else
     end
 end
 
 function VirtualPageCanvas:setPadding(padding)
     padding = math.max(0, tonumber(padding) or 0)
     if padding ~= self.padding then
-        logger.info("VPC:setPadding", "from", self.padding, "to", padding)
         self.padding = padding
         self._layout_dirty = true
         self:markDirty()
@@ -154,7 +143,6 @@ end
 function VirtualPageCanvas:setHorizontalMargin(margin)
     margin = math.max(0, tonumber(margin) or 0)
     if margin ~= self.horizontal_margin then
-        logger.info("VPC:setHorizontalMargin", "from", self.horizontal_margin, "to", margin)
         self.horizontal_margin = margin
         if self.mode == "scroll" then
             self._layout_dirty = true
@@ -165,7 +153,6 @@ end
 
 function VirtualPageCanvas:setBackground(color)
     if self.background ~= color then
-        logger.info("VPC:setBackground", "from", self.background, "to", color)
         self.background = color
         self:markDirty()
     end
@@ -174,7 +161,6 @@ end
 function VirtualPageCanvas:setPageGapHeight(gap)
     gap = math.max(0, tonumber(gap) or 0)
     if math.abs(gap - (self.page_gap_height or 0)) > 0.5 then
-        logger.info("VPC:setPageGapHeight", "from", self.page_gap_height, "to", gap)
         self.page_gap_height = gap
         if self.mode == "scroll" then
             self._layout_dirty = true
@@ -192,7 +178,6 @@ function VirtualPageCanvas:setSize(w, h)
     h = tonumber(h) or 0
 
     if not self.dimen then
-        logger.info("VPC:setSize init", "w", w, "h", h)
         self.dimen = Geom:new{ x = 0, y = 0, w = w, h = h }
         self._layout_dirty = true
         self:markDirty()
@@ -200,7 +185,6 @@ function VirtualPageCanvas:setSize(w, h)
     end
 
     if self.dimen.w ~= w or self.dimen.h ~= h then
-        logger.info("VPC:setSize", "from", self.dimen.w, self.dimen.h, "to", w, h)
         self.dimen.w = w
         self.dimen.h = h
         self._layout_dirty = true
@@ -215,7 +199,6 @@ function VirtualPageCanvas:getViewportSize()
     end
     local w = math.max(0, self.dimen.w - 2 * horizontal_spacing)
     local h = math.max(0, self.dimen.h - 2 * self.padding)
-    logger.dbg("VPC:getViewportSize", "canvas_w", self.dimen.w, "canvas_h", self.dimen.h, "padding", self.padding, "h_margin", self.horizontal_margin or 0, "viewport_w", w, "viewport_h", h)
     return w, h
 end
 
@@ -247,15 +230,12 @@ function VirtualPageCanvas:_computeZoomForPage(page)
     end
 
     local viewport_w, viewport_h = self:getViewportSize()
-    local rotation = self.rotation or 0
     if viewport_w <= 0 or viewport_h <= 0 then
-        logger.warn("ZOOM_DEBUG", "reason", "invalid_viewport", "page", page, "rotation", rotation, "viewport_w", viewport_w, "viewport_h", viewport_h, "padding", self.padding or 0, "canvas_w", self.dimen and self.dimen.w, "canvas_h", self.dimen and self.dimen.h)
         return self.zoom
     end
 
     local dims = self.document:getNativePageDimensions(page)
     if not dims or dims.w <= 0 or dims.h <= 0 then
-        logger.warn("ZOOM_DEBUG", "reason", "invalid_native_dims", "page", page, "rotation", rotation, "native_w", dims and dims.w or 0, "native_h", dims and dims.h or 0)
         return self.zoom
     end
 
@@ -267,31 +247,9 @@ function VirtualPageCanvas:_computeZoomForPage(page)
     if page_w <= 0 or page_h <= 0 then
         return self.zoom
     end
-    local rotated_dims
-    local ok_rot, rd = pcall(function()
-        return self.document:getPageDimensions(page, 1.0, rotation)
-    end)
-    if ok_rot then rotated_dims = rd end
-
-    logger.warn("ZOOM_DEBUG_INPUT",
-        "page", page,
-        "rotation", rotation,
-        "zoom_mode", self.zoom_mode,
-        "viewport_w", viewport_w, "viewport_h", viewport_h,
-        "native_w", dims.w, "native_h", dims.h,
-        "effective_w", page_w, "effective_h", page_h,
-        "rotated_doc_w", rotated_dims and rotated_dims.w or nil,
-        "rotated_doc_h", rotated_dims and rotated_dims.h or nil,
-        "padding", self.padding or 0)
 
     local zoom_w = viewport_w / page_w
     local zoom_h = viewport_h / page_h
-    logger.dbg("VPC:_computeZoomForPage",
-        "page", page,
-        "page_w", page_w, "page_h", page_h,
-        "viewport_w", viewport_w, "viewport_h", viewport_h,
-        "zoom_w", zoom_w, "zoom_h", zoom_h,
-        "mode", self.zoom_mode)
 
     local result
     if self.zoom_mode == 1 then -- width
@@ -305,17 +263,10 @@ function VirtualPageCanvas:_computeZoomForPage(page)
             result = viewport_h / page_h
         end
     end
-    logger.warn("ZOOM_DEBUG_RESULT",
-        "page", page,
-        "rotation", rotation,
-        "zoom_mode", self.zoom_mode,
-        "zoom_w", zoom_w, "zoom_h", zoom_h,
-        "result", result)
     return result
 end
 
 function VirtualPageCanvas:_ensureZoom()
-    local original_zoom = self.zoom
     if self.mode == "scroll" and self.zoom_mode == 1 then
         local viewport_w = select(1, self:getViewportSize())
         if viewport_w > 0 and self.document and self.document.is_open and self.document._ensureVirtualLayout then
@@ -332,11 +283,9 @@ function VirtualPageCanvas:_ensureZoom()
             if target_width and target_width > 0 then
                 local computed = viewport_w / target_width
                 if computed > 0 and math.abs(computed - (self.zoom or 0)) > 1e-6 then
-                    logger.info("VPC:_ensureZoom width-based", "computed", computed, "prev", self.zoom, "target_width", target_width, "viewport_w", viewport_w)
                     self.zoom = computed
                     self._layout_dirty = true
                 end
-                logger.info("VPC:_ensureZoom state", "mode", self.mode, "zoom_mode", self.zoom_mode, "page", self.current_page, "zoom", self.zoom, "layout_dirty", self._layout_dirty)
                 return
             end
         end
@@ -345,27 +294,22 @@ function VirtualPageCanvas:_ensureZoom()
     local page = self.current_page or 1
     local computed = self:_computeZoomForPage(page)
     if computed and computed > 0 and math.abs(computed - self.zoom) > 1e-6 then
-        logger.info("VPC:_ensureZoom page-based", "page", page, "computed", computed, "prev", self.zoom)
         self.zoom = computed
         self._layout_dirty = true
     end
-    logger.info("VPC:_ensureZoom state", "mode", self.mode, "zoom_mode", self.zoom_mode, "page", page, "zoom", self.zoom, "layout_dirty", self._layout_dirty, "original_zoom", original_zoom)
 end
 
 function VirtualPageCanvas:recalculateLayout()
-    logger.info("VPC:recalculateLayout start", "layout_dirty", self._layout_dirty, "has_document", self.document ~= nil, "mode", self.mode, "scroll_offset", self.scroll_offset or 0)
     self:_ensureZoom()
     self._layout_dirty = false
     self._virtual_height = 0
 
     if not self.document or not self.document.is_open then
-        logger.info("VPC:recalculateLayout abort", "document_open", self.document and self.document.is_open)
         return
     end
 
     if self.document.virtual_layout == nil or self.document.total_virtual_height == nil then
         if self.document._calculateVirtualLayout then
-            logger.info("VPC:recalculateLayout invoking document _calculateVirtualLayout")
             self.document:_calculateVirtualLayout()
         end
     end
@@ -385,7 +329,6 @@ function VirtualPageCanvas:recalculateLayout()
     end
 
     self.scroll_offset = Math.clamp(self.scroll_offset or 0, 0, self:getMaxScrollOffset())
-    logger.info("VPC:recalculateLayout done", "virtual_height", self._virtual_height, "max_scroll_offset", self:getMaxScrollOffset(), "scroll_offset", self.scroll_offset, "document_layout_dirty", self.document and self.document._virtual_layout_dirty)
 end
 
 function VirtualPageCanvas:markDirty()
@@ -399,10 +342,6 @@ function VirtualPageCanvas:paintTo(target, x, y)
     local canvas_w = self.dimen.w
     local canvas_h = self.dimen.h
     if canvas_w <= 0 or canvas_h <= 0 then return end
-
-    local tw = target.getWidth and target:getWidth() or nil
-    local th = target.getHeight and target:getHeight() or nil
-    logger.dbg("VPC:paintTo target", "tw", tw, "th", th, "canvas_w", canvas_w, "canvas_h", canvas_h, "x", x, "y", y)
 
     target:paintRect(x, y, canvas_w, canvas_h, self.background)
 
@@ -418,14 +357,10 @@ function VirtualPageCanvas:paintTo(target, x, y)
 end
 
 function VirtualPageCanvas:_renderFullPage(page)
-    logger.dbg("VPC:_renderFullPage request", "page", page, "zoom", self.zoom, "rotation", self.rotation)
     local ok, tile = pcall(function()
         return self.document:renderPage(page, nil, self.zoom, self.rotation)
     end)
     if ok then
-        if tile and tile.bb then
-            logger.dbg("VPC:_renderFullPage result", "page", page, "bb_w", tile.bb:getWidth(), "bb_h", tile.bb:getHeight(), "stride", tile.bb.stride)
-        end
         return tile
     end
     logger.warn("VPC:_renderFullPage failed:", tile)
@@ -457,8 +392,6 @@ function VirtualPageCanvas:paintSinglePage(target, x, y)
     if scaled_w <= 0 or scaled_h <= 0 then
         return
     end
-
-    logger.info("VPC:paintSinglePage", "page", page, "zoom", zoom, "rotation", rotation, "viewport", viewport_w, viewport_h, "scaled", scaled_w, scaled_h, "center", self.center_x_ratio, self.center_y_ratio)
 
     -- Try full page render - document handles native caching and scaling
     local tile = self:_renderFullPage(page)
@@ -520,8 +453,6 @@ function VirtualPageCanvas:paintSinglePage(target, x, y)
     local dest_x = x + self.padding + math.floor((viewport_w - view_w) / 2)
     local dest_y = y + self.padding + math.floor((viewport_h - view_h) / 2)
 
-    logger.dbg("VPC:paintSinglePage partial", "page", page, "dest_x", dest_x, "dest_y", dest_y, "view_w", view_w, "view_h", view_h, "src_x", rect.scaled_rect.x, "src_y", rect.scaled_rect.y, "src_w", rect.scaled_rect.w, "src_h", rect.scaled_rect.h)
-
     local ok_draw = pcall(function()
         return self.document:drawPageTiled(target, dest_x, dest_y, rect, page, zoom, rotation, nil, 1, true)
     end)
@@ -532,12 +463,10 @@ end
 
 function VirtualPageCanvas:_prepareLayout()
     if self._layout_dirty then
-        logger.info("VPC:_prepareLayout recalculating")
         self:recalculateLayout()
     end
     if not (self.document and self.document.virtual_layout) then
         if self.document and self.document._calculateVirtualLayout then
-            logger.info("VPC:_prepareLayout calculating document layout")
             self.document:_calculateVirtualLayout()
         end
     end
@@ -614,9 +543,6 @@ function VirtualPageCanvas:_renderPageSlice(page_info, zoom, slice_top_px, slice
         w = scaled_w,
         h = scaled_h,
     }
-
-    logger.info("VPC:_renderPageSlice", "page", page_num, "zoom", image_zoom, "rotation", self.rotation, "native_y", native_y, "native_h", native_h, "scaled_w", scaled_w, "scaled_h", scaled_h)
-    logger.info("VPC:_renderPageSlice rect", "x", rect.x, "y", rect.y, "w", rect.w, "h", rect.h)
 
     local ok, slice = pcall(function()
         return self.document:renderPage(page_num, rect, image_zoom, self.rotation)
@@ -720,7 +646,6 @@ function VirtualPageCanvas:paintScroll(target, x, y, retry)
 end
 
 function VirtualPageCanvas:onCloseWidget()
-    logger.info("VPC:onCloseWidget")
     self.document = nil
 end
 

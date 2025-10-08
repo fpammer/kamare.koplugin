@@ -26,8 +26,6 @@ function KavitaClient:authenticate(server_url, apiKey)
     local auth_url = base_endpoint .. "?apiKey=" .. url.escape(apiKey) .. "&pluginName=" .. url.escape("KaMaRe.koplugin")
     local sink = {}
 
-    logger.dbg("KavitaClient:authenticate: auth_endpoint =", base_endpoint, "apiKey_len =", (apiKey and #apiKey or 0))
-
     socketutil:set_timeout(socketutil.LARGE_BLOCK_TIMEOUT, socketutil.LARGE_TOTAL_TIMEOUT)
     local ok, code, headers, status = pcall(function()
         return socket.skip(1, http.request{
@@ -45,7 +43,6 @@ function KavitaClient:authenticate(server_url, apiKey)
         logger.warn("KavitaClient:authenticate: request failed with LuaSocket error:", code)
         return nil, -1, nil, code
     end
-    logger.dbg("KavitaClient:authenticate: HTTP response code =", code, "status =", status)
 
     if code ~= 200 and code ~= 201 then
         logger.warn("KavitaClient:authenticate: non-OK status:", code, status)
@@ -53,20 +50,13 @@ function KavitaClient:authenticate(server_url, apiKey)
     end
 
     local body = table.concat(sink)
-    logger.dbg("KavitaClient:authenticate: response body length =", (body and #body or 0))
     local okj, decoded = pcall(rapidjson.decode, body)
     if not okj or type(decoded) ~= "table" then
         logger.warn("KavitaClient:authenticate: JSON decode failed")
         return nil, code, headers, "Invalid JSON auth response"
     end
 
-    local keys = {}
-    for k, _ in pairs(decoded) do table.insert(keys, k) end
-    table.sort(keys)
-    logger.dbg("KavitaClient:authenticate: decoded JSON keys =", table.concat(keys, ", "))
-
     local token = decoded.token
-    logger.dbg("KavitaClient:authenticate: token present =", (type(token) == "string"), "token_len =", (type(token) == "string" and #token or 0))
     if type(token) ~= "string" or token == "" then
         logger.warn("KavitaClient:authenticate: token missing in JSON response")
         return nil, code, headers, "No token in JSON response"
@@ -182,7 +172,6 @@ function KavitaClient:apiRequest(path, opts)
     for k, v in pairs(extra_headers) do headers[k] = v end
 
     local sink_tbl = {}
-    logger.dbg("KavitaClient:apiRequest:", method, redact_api_key_in_url(full_url))
 
     local bt = opts.block_timeout
     local tt = opts.total_timeout
@@ -213,7 +202,6 @@ function KavitaClient:apiRequest(path, opts)
     end
 
     local body_str = table.concat(sink_tbl)
-    logger.dbg("KavitaClient:apiRequest: code =", code, "status =", status, "body_len =", (body_str and #body_str or 0))
     return code, resp_headers, status, body_str
 end
 
@@ -235,8 +223,6 @@ function KavitaClient:apiJSON(path, opts)
     if not ok or type(decoded) ~= "table" then
         local ct = headers and (headers["content-type"] or headers["Content-Type"]) or "unknown"
         logger.warn("KavitaClient:apiJSON: JSON decode failed; content-type=", ct)
-        local prefix = s:sub(1, 200):gsub("[%c]", " ")
-        logger.dbg("KavitaClient:apiJSON: body prefix =", prefix)
         return nil, code, headers, "Invalid JSON", body
     end
     return decoded, code, headers, status, body
@@ -258,7 +244,6 @@ function KavitaClient:getSeriesById(seriesId)
         return nil, nil, nil, "seriesId required", nil
     end
     local path = "/api/Series/" .. tostring(seriesId)
-    logger.dbg("KavitaClient:getSeriesById:", path)
     local data, code, headers, status, body = self:apiJSONCached(path, { method = "GET" }, 600, "kavita|series")
     return data, code, headers, status, body
 end
@@ -331,7 +316,6 @@ function KavitaClient:getStreamSeries(name, params)
         if query.visibleOnly == nil then query.visibleOnly = true end
     end
 
-    logger.dbg("KavitaClient:getStreamSeries:", method, path)
     local data, code, headers, status, body_str = self:apiJSONCached(path, {
         method = method,
         query  = query,
@@ -348,7 +332,6 @@ function KavitaClient:getSeriesDetail(seriesId)
         return nil, nil, nil, "seriesId required", nil
     end
     local path = "/api/Series/series-detail"
-    logger.dbg("KavitaClient:getSeriesDetail:", path, "seriesId=", seriesId)
     local data, code, headers, status, body = self:apiJSON(path, {
         method = "GET",
         query  = { seriesId = seriesId },
@@ -408,18 +391,12 @@ function KavitaClient:createReaderPageTable(chapter_id, ctx)
             timeout_profile = "file",
         })
 
-        if type(code) ~= "number" then
-            logger.dbg("KavitaClient: Reader image request failed:", status or code)
+        if type(code) ~= "number" or code ~= 200 then
             return nil
         end
 
-        if code == 200 then
-            -- No reading progress side-effects here; handled by viewer when page is shown
-            return body_str
-        else
-            logger.dbg("KavitaClient: Reader image request failed:", status or code)
-            return nil
-        end
+        -- No reading progress side-effects here; handled by viewer when page is shown
+        return body_str
     end })
 
     return page_table
@@ -478,7 +455,6 @@ function KavitaClient:getSearch(queryString, includeChapterAndFiles)
         queryString = queryString,
         includeChapterAndFiles = includeChapterAndFiles == nil and false or includeChapterAndFiles,
     }
-    logger.dbg("KavitaClient:getSearch:", path, "q=", queryString)
     local data, code, headers, status, body = self:apiJSONCached(path, {
         method = "GET",
         query  = params,
@@ -494,7 +470,6 @@ function KavitaClient:getContinuePoint(seriesId)
         return nil, nil, nil, "seriesId required", nil
     end
     local path = "/api/Reader/continue-point"
-    logger.dbg("KavitaClient:getContinuePoint:", path, "seriesId=", seriesId)
     local data, code, headers, status, body = self:apiJSON(path, {
         method = "GET",
         query  = { seriesId = seriesId },

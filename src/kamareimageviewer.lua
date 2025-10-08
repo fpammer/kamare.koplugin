@@ -214,27 +214,13 @@ end
 --  Settings
 ------------------------------------------------------------------------
 
-function KamareImageViewer:getKamareSettings()
-    if self.ui and self.ui.kamare and self.ui.kamare.kamare_settings then
-        return self.ui.kamare.kamare_settings
-    end
-
-    local file = DataStorage:getSettingsDir() .. "/kamare.lua"
-    local settings = LuaSettings:open(file)
-    logger.info("KIV:getKamareSettings", "file", file, "has_data", next(settings.data) ~= nil, "data", settings.data)
-
-    if next(settings.data) ~= nil then
-        return settings
-    end
-
-    settings:close()
-    return nil
-end
-
 function KamareImageViewer:loadSettings()
-    local settings = self:getKamareSettings()
+    if not self.kamare_settings then
+        logger.warn("KIV:loadSettings: no settings object")
+        return
+    end
 
-    logger.info("KIV:loadSettings enter", "has_settings", settings ~= nil)
+    local settings = self.kamare_settings
 
     -- Preseed with current state; Configurable will overwrite if present
     self.configurable.footer_mode = self.footer_settings.mode
@@ -246,14 +232,7 @@ function KamareImageViewer:loadSettings()
     self.configurable.scroll_margin = self.scroll_margin
     self.configurable.page_padding = self.page_padding
 
-    if settings then
-        self.configurable:loadSettings(settings, self.options.prefix .. "_")
-        logger.info("KIV:loadSettings raw",
-            "footer_mode", self.configurable.footer_mode,
-            "prefetch_pages", self.configurable.prefetch_pages,
-            "scroll_mode", self.configurable.scroll_mode,
-            "zoom_mode_type", self.configurable.zoom_mode_type)
-    end
+    self.configurable:loadSettings(settings, self.options.prefix .. "_")
 
     self.footer_settings.mode = self.configurable.footer_mode
     self.prefetch_pages = self.configurable.prefetch_pages or 1
@@ -274,20 +253,8 @@ function KamareImageViewer:loadSettings()
     self.configurable.scroll_margin = self.scroll_margin
     self.configurable.page_padding = self.page_padding
 
-    logger.info("KIV:loadSettings applied",
-        "footer_mode", self.footer_settings.mode,
-        "prefetch_pages", self.prefetch_pages,
-        "scroll_mode", self.scroll_mode,
-        "zoom_mode", self.zoom_mode,
-        "page_padding", self.page_padding,
-        "scroll_margin", self.scroll_margin)
-
-    logger.info("KIV:loadSettings resolved", "footer_mode", self.footer_settings.mode, "prefetch_pages", self.prefetch_pages, "scroll_mode", self.scroll_mode, "zoom_mode", self.zoom_mode)
-
     -- Save immediately to ensure all defaults are persisted
-    if settings then
-        self:syncAndSaveSettings()
-    end
+    self:syncAndSaveSettings()
 end
 
 function KamareImageViewer:syncAndSaveSettings()
@@ -304,26 +271,22 @@ function KamareImageViewer:syncAndSaveSettings()
 end
 
 function KamareImageViewer:saveSettings()
-    local settings = self:getKamareSettings()
-    if settings then
-        -- Ensure all values are in configurable before saving
-        self.configurable.footer_mode = self.configurable.footer_mode or self.footer_settings.mode
-        self.configurable.prefetch_pages = self.configurable.prefetch_pages or self.prefetch_pages
-        self.configurable.scroll_mode = self.configurable.scroll_mode ~= nil and self.configurable.scroll_mode or (self.scroll_mode and 1 or 0)
-        self.configurable.zoom_mode_type = self.configurable.zoom_mode_type or self.zoom_mode
-        self.configurable.page_gap_height = self.configurable.page_gap_height or self.page_gap_height
-        self.configurable.scroll_distance = self.configurable.scroll_distance or self.scroll_distance
-        self.configurable.scroll_margin = self.configurable.scroll_margin or self.scroll_margin
-        self.configurable.page_padding = self.configurable.page_padding or self.page_padding
-
-        self.configurable:saveSettings(settings, self.options.prefix .. "_")
-        settings:flush()
-
-        logger.dbg("KIV:saveSettings saved",
-            "page_padding", self.configurable.page_padding,
-            "scroll_margin", self.configurable.scroll_margin,
-            "page_gap", self.configurable.page_gap_height)
+    if not self.kamare_settings then
+        logger.warn("KIV:saveSettings: no settings object")
+        return
     end
+
+    -- Ensure all values are in configurable before saving
+    self.configurable.footer_mode = self.configurable.footer_mode or self.footer_settings.mode
+    self.configurable.prefetch_pages = self.configurable.prefetch_pages or self.prefetch_pages
+    self.configurable.scroll_mode = self.configurable.scroll_mode ~= nil and self.configurable.scroll_mode or (self.scroll_mode and 1 or 0)
+    self.configurable.zoom_mode_type = self.configurable.zoom_mode_type or self.zoom_mode
+    self.configurable.page_gap_height = self.configurable.page_gap_height or self.page_gap_height
+    self.configurable.scroll_distance = self.configurable.scroll_distance or self.scroll_distance
+    self.configurable.scroll_margin = self.configurable.scroll_margin or self.scroll_margin
+    self.configurable.page_padding = self.configurable.page_padding or self.page_padding
+
+    self.configurable:saveSettings(self.kamare_settings, self.options.prefix .. "_")
 end
 
 function KamareImageViewer:getCurrentZoom()
@@ -747,8 +710,6 @@ function KamareImageViewer:onSetPrefetchPages(value)
     self.prefetch_pages = n
     self.configurable.prefetch_pages = n
     self:syncAndSaveSettings()
-
-    logger.dbg("KIV:onSet PrefetchPages", "n", n)
 
     UIManager:nextTick(function() self:prefetchUpcomingTiles() end)
     return true

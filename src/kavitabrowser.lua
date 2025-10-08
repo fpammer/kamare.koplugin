@@ -50,7 +50,6 @@ function KavitaBrowser:init()
         Menu.init(self) -- Initialize Menu first
 
         -- Then load the server's content
-        logger.dbg("KavitaBrowser:init: auto-selecting single server", single_server.name, single_server.url)
         self.current_server_name = single_server.name
         self:authenticateAfterSelection(single_server.name, single_server.url)
         self:showDashboardAfterSelection(single_server.name)
@@ -486,8 +485,6 @@ function KavitaBrowser:showKavitaStream(stream_name)
             return
         end
 
-        logger.dbg("KavitaBrowser:showKavitaStream: page", page_num, "type(data) =", type(data), "array_len =", (type(data) == "table" and #data or 0))
-
         -- Append results to all_data
         if type(data) == "table" and #data > 0 then
             for _, item in ipairs(data) do
@@ -510,7 +507,6 @@ function KavitaBrowser:showKavitaStream(stream_name)
     UIManager:close(loading)
 
     local data = all_data
-    logger.dbg("KavitaBrowser:showKavitaStream: total items =", (type(data) == "table" and #data or 0))
 
     -- Special handling: Recently Updated returns RecentlyAddedItemDto[]
     if stream_name == "recently-updated" or stream_name == "recently-updated-series" then
@@ -562,7 +558,6 @@ function KavitaBrowser:showKavitaStream(stream_name)
             series_list = tmp
         end
     end
-    logger.dbg("KavitaBrowser:showKavitaStream: normalized series_list len =", (type(series_list) == "table" and #series_list or 0))
 
     local items = self:buildKavitaSeriesItems(series_list or {})
 
@@ -599,20 +594,17 @@ end
 
 -- Persist bearer token for a server into Kamare settings
 function KavitaBrowser:persistBearerToken(server_name, server_url, token)
-    if not (self._manager and self._manager.kamare_settings) then
-        logger.warn("KavitaBrowser:persistBearerToken: no manager/settings")
+    if not self.kamare_settings then
+        logger.warn("KavitaBrowser:persistBearerToken: no settings")
         return
     end
-    logger.dbg("KavitaBrowser:persistBearerToken: begin", server_name, server_url, "token_len", (type(token) == "string" and #token or 0))
-    local settings = self._manager.kamare_settings
-    local servers = settings:readSetting("servers", {}) or {}
+
+    local servers = self.kamare_settings:readSetting("servers", {}) or {}
     local updated = false
-    logger.dbg("KavitaBrowser:persistBearerToken: servers_len", #servers)
 
     if type(servers) == "table" then
         for i, s in ipairs(servers) do
             if type(s) == "table" and (s.url == server_url or s.name == server_name) then
-                logger.dbg("KavitaBrowser:persistBearerToken: matched index", i, "existing_bearer_len", (type(s.bearer) == "string" and #s.bearer or 0))
                 -- Update token and metadata
                 servers[i].bearer = token
                 servers[i].updated_at = os.time()
@@ -628,7 +620,6 @@ function KavitaBrowser:persistBearerToken(server_name, server_url, token)
                 bearer = token,
                 updated_at = os.time(),
             })
-            logger.dbg("KavitaBrowser:persistBearerToken: inserted new entry at index", #servers)
             updated = true
         end
     else
@@ -640,32 +631,20 @@ function KavitaBrowser:persistBearerToken(server_name, server_url, token)
                 updated_at = os.time(),
             }
         }
-        logger.dbg("KavitaBrowser:persistBearerToken: rebuilt servers table with single entry")
     end
 
-    settings:saveSetting("servers", servers)
-    self._manager.servers = servers
+    self.kamare_settings:saveSetting("servers", servers)
     self.servers = servers
-    self._manager.updated = true
-    logger.dbg("KavitaBrowser:persistBearerToken: saved servers, will flush =", updated)
-
-    if updated then
-        settings:flush()
-        logger.dbg("KavitaBrowser:persistBearerToken: settings flushed")
-    end
 end
 
 -- Authenticate after selecting a server using config (no dialog)
 function KavitaBrowser:authenticateAfterSelection(server_name, server_url)
-    logger.dbg("KavitaBrowser:authenticateAfterSelection: start", server_name, server_url)
-    local settings = self._manager and self._manager.kamare_settings
-    if not settings then
+    if not self.kamare_settings then
         logger.warn("KavitaBrowser:authenticateAfterSelection: no settings available")
         return
     end
 
-    local servers = settings:readSetting("servers", {}) or {}
-    logger.dbg("KavitaBrowser:authenticateAfterSelection: servers_len", #servers)
+    local servers = self.kamare_settings:readSetting("servers", {}) or {}
 
     -- Always (re)authenticate after selection to ensure fresh token
 
@@ -674,7 +653,6 @@ function KavitaBrowser:authenticateAfterSelection(server_name, server_url)
     for i, s in ipairs(servers) do
         if type(s) == "table" and (s.url == server_url or s.name == server_name) then
             entry = s
-            logger.dbg("KavitaBrowser:authenticateAfterSelection: matched server at index", i)
             break
         end
     end
@@ -688,18 +666,16 @@ function KavitaBrowser:authenticateAfterSelection(server_name, server_url)
     local base_url = entry.kavita_url
 
     if not apiKey or apiKey == "" or not base_url or base_url == "" then
-        logger.warn("KavitaBrowser:authenticateAfterSelection: missing api_key or kavita_url", "api_len", (apiKey and #apiKey or 0), "base_url", tostring(base_url))
+        logger.warn("KavitaBrowser:authenticateAfterSelection: missing api_key or kavita_url")
         return
     end
 
-    logger.dbg("KavitaBrowser:authenticateAfterSelection: calling KavitaClient.authenticate", base_url, "api_len", (apiKey and #apiKey or 0))
     -- Authenticate and persist bearer token
     local token, code, _, err = KavitaClient:authenticate(base_url, apiKey)
     if not token then
         logger.warn("KavitaBrowser:authenticateAfterSelection: authentication failed", code, err)
         return
     end
-    logger.dbg("KavitaBrowser:authenticateAfterSelection: got token, len", #token)
 
     -- Keep client api_key for endpoints that require it as query param
     KavitaClient.api_key = apiKey
@@ -806,7 +782,11 @@ function KavitaBrowser:editServerFromInput(fields, item)
     self.servers[new_idx] = new_server
     self.item_table[new_idx] = new_item
     self:switchItemTable(nil, self.item_table, itemnumber)
-    self._manager.updated = true
+
+    -- Save servers to settings (will be flushed by main plugin)
+    if self.kamare_settings then
+        self.kamare_settings:saveSetting("servers", self.servers)
+    end
 end
 
 -- Deletes catalog from the root list
@@ -814,7 +794,11 @@ function KavitaBrowser:deleteCatalog(item)
     table.remove(self.servers, item.idx)
     table.remove(self.item_table, item.idx)
     self:switchItemTable(nil, self.item_table, -1)
-    self._manager.updated = true
+
+    -- Save servers to settings (will be flushed by main plugin)
+    if self.kamare_settings then
+        self.kamare_settings:saveSetting("servers", self.servers)
+    end
 end
 
 -- Handle errors from catalog fetching
@@ -947,8 +931,8 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name)
         preloaded_dimensions = preloaded_dimensions,
         preloaded_iswide = preloaded_iswide,
         metadata = metadata,
+        kamare_settings = self.kamare_settings,
         on_close_callback = function(current_page, total_pages)
-            logger.dbg("Reader closed - ended at page", current_page, "of", total_pages)
             local sid = self.current_series_id
             if not sid then return end
             local lid = self.current_series_library_id
@@ -1013,7 +997,6 @@ function KavitaBrowser:onMenuSelect(item)
     end
     if #self.paths == 0 then -- root list
         self.current_server_name    = item.text
-        logger.dbg("KavitaBrowser:onMenuSelect: root selection", item.text, item.url)
         self:authenticateAfterSelection(item.text, item.url)
         self:showDashboardAfterSelection(item.text)
         return true
