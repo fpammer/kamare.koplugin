@@ -22,6 +22,7 @@ local VirtualImageDocument = require("virtualimagedocument")
 local VirtualPageCanvas = require("virtualpagecanvas")
 local KavitaClient = require("kavitaclient")
 local Math = require("optmath")
+local ButtonDialog = require("ui/widget/buttondialog")
 local _ = require("gettext")
 local T = require("ffi/util").template
 
@@ -1043,7 +1044,13 @@ function KamareImageViewer:_scrollStep(direction)
             if self._images_list_cur < self._images_list_nb then
                 self:switchToImageNum(self._images_list_cur + 1)
             else
-                self:_setScrollOffset(math.max(0, total - viewport_h))
+                -- Already at the end of the last page, check for next chapter
+                local at_bottom = offset >= total - viewport_h - 1
+                if at_bottom then
+                    self:_checkAndOfferNextChapter()
+                else
+                    self:_setScrollOffset(math.max(0, total - viewport_h))
+                end
             end
         else
             self:_scrollBy(step)
@@ -1486,6 +1493,9 @@ function KamareImageViewer:onShowNextImage()
 
     if self._images_list_cur < self._images_list_nb then
         self:switchToImageNum(self._images_list_cur + 1)
+    else
+        -- Reached the end, check for next chapter
+        self:_checkAndOfferNextChapter()
     end
 end
 
@@ -1523,6 +1533,88 @@ function KamareImageViewer:onShowPrevSlice()
 end
 
 ------------------------------------------------------------------------
+--  Next chapter handling
+------------------------------------------------------------------------
+
+function KamareImageViewer:_checkAndOfferNextChapter()
+    -- Only proceed if we have metadata and KavitaClient
+    if not (self.metadata and KavitaClient and KavitaClient.bearer) then
+        logger.dbg("KamareImageViewer: Cannot check next chapter - missing metadata or KavitaClient")
+        return
+    end
+
+    local seriesId = self.metadata.seriesId or self.metadata.series_id
+    local volumeId = self.metadata.volumeId or self.metadata.volume_id
+    local currentChapterId = self.metadata.chapterId or self.metadata.chapter_id
+
+    if not (seriesId and volumeId and currentChapterId) then
+        logger.warn("KamareImageViewer: Missing required IDs for next chapter query")
+        return
+    end
+
+    logger.info("KamareImageViewer: Querying next chapter for series", seriesId, "volume", volumeId, "chapter", currentChapterId)
+
+    -- Query for next chapter ID
+    UIManager:nextTick(function()
+        local nextChapterId, code, headers, status, body = KavitaClient:getNextChapter(seriesId, volumeId, currentChapterId)
+
+        -- Check if result is -1 (no next chapter) or invalid response
+        if nextChapterId == -1 or not nextChapterId or type(code) ~= "number" or code < 200 or code >= 300 then
+            -- Show dialog with only Close button (no cancel)
+            self.next_chapter_dialog = ButtonDialog:new{
+                title = _("You've reached the end of the series"),
+                title_align = "center",
+                buttons = {
+                    {
+                        {
+                            text = _("Close"),
+                            callback = function()
+                                UIManager:close(self.next_chapter_dialog)
+                                self.next_chapter_dialog = nil
+                                self:onClose()
+                            end,
+                        },
+                    },
+                },
+            }
+            UIManager:show(self.next_chapter_dialog)
+            return
+        end
+
+        -- Show dialog with only Close and Continue buttons (no cancel)
+        self.next_chapter_dialog = ButtonDialog:new{
+            title = _("Continue to next chapter?"),
+            title_align = "center",
+            buttons = {
+                {
+                    {
+                        text = _("Close"),
+                        callback = function()
+                            UIManager:close(self.next_chapter_dialog)
+                            self.next_chapter_dialog = nil
+                            self:onClose()
+                        end,
+                    },
+                    {
+                        text = _("Continue"),
+                        callback = function()
+                            UIManager:close(self.next_chapter_dialog)
+                            self.next_chapter_dialog = nil
+                            -- Notify parent to load next chapter
+                            if self.on_next_chapter_callback then
+                                self.on_next_chapter_callback(nextChapterId)
+                            end
+                            self:onClose()
+                        end,
+                    },
+                },
+            },
+        }
+        UIManager:show(self.next_chapter_dialog)
+    end)
+end
+
+------------------------------------------------------------------------
 --  Prefetch progress reporting
 ------------------------------------------------------------------------
 
@@ -1555,6 +1647,12 @@ end
 ------------------------------------------------------------------------
 
 function KamareImageViewer:onClose()
+    -- Close any open next chapter dialog
+    if self.next_chapter_dialog then
+        UIManager:close(self.next_chapter_dialog)
+        self.next_chapter_dialog = nil
+    end
+
     -- Finalize statistics tracking using direct API
     if self.ui and self.ui.statistics then
         logger.info("KamareImageViewer: Calling statistics:onCloseDocument")

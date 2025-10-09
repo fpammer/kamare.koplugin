@@ -944,6 +944,74 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name)
                 self:showSeriesDetail(sname, sid, lid, { refresh_only = true })
             end)
         end,
+        on_next_chapter_callback = function(next_chapter_id)
+            -- Fetch the next chapter details and launch viewer
+            UIManager:nextTick(function()
+                local loading = InfoMessage:new{ text = _("Loading next chapter..."), timeout = 0 }
+                UIManager:show(loading)
+                UIManager:forceRePaint()
+
+                -- Get series detail to find the chapter
+                local sid = self.current_series_id
+                local lid = self.current_series_library_id
+                if not sid then
+                    UIManager:close(loading)
+                    UIManager:show(InfoMessage:new{ text = _("Cannot load next chapter: missing series info") })
+                    return
+                end
+
+                local detail, code = KavitaClient:getSeriesDetail(sid)
+                UIManager:close(loading)
+
+                if not detail then
+                    UIManager:show(InfoMessage:new{ text = _("Failed to load next chapter") })
+                    return
+                end
+
+                -- Find the chapter with matching ID
+                local next_chapter
+                if detail.volumes then
+                    for _, vol in ipairs(detail.volumes) do
+                        if vol.chapters then
+                            for _, ch in ipairs(vol.chapters) do
+                                if ch.id == next_chapter_id then
+                                    next_chapter = ch
+                                    break
+                                end
+                            end
+                        end
+                        if next_chapter then break end
+                    end
+                end
+                if not next_chapter and detail.chapters then
+                    for _, ch in ipairs(detail.chapters) do
+                        if ch.id == next_chapter_id then
+                            next_chapter = ch
+                            break
+                        end
+                    end
+                end
+                if not next_chapter and detail.specials then
+                    for _, ch in ipairs(detail.specials) do
+                        if ch.id == next_chapter_id then
+                            next_chapter = ch
+                            break
+                        end
+                    end
+                end
+
+                if not next_chapter then
+                    UIManager:show(InfoMessage:new{ text = _("Next chapter not found") })
+                    return
+                end
+
+                -- Launch the viewer for the next chapter
+                local sname = self.catalog_title
+                    or (self.current_series_names and (self.current_series_names.localizedName or self.current_series_names.name))
+                    or _("Series")
+                self:launchKavitaChapterViewer(next_chapter, sname)
+            end)
+        end,
     }
     UIManager:show(viewer)
     return viewer

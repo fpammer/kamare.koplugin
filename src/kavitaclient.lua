@@ -8,18 +8,11 @@ local url = require("socket.url")
 local rapidjson = require("rapidjson")
 local md5 = require("ffi/sha2").md5
 
--- Redact sensitive query params in debug logs
-local function redact_api_key_in_url(u)
-    if type(u) ~= "string" then return u end
-    return (u:gsub("([?&]apiKey=)[^&]+", "%1REDACTED"))
-end
-
 local ApiCache = Cache:new{
     slots = 20,
 }
 
 local KavitaClient = {}
-
 
 function KavitaClient:authenticate(server_url, apiKey)
     local base_endpoint = (server_url:gsub("/+$", "")) .. "/api/Plugin/authenticate"
@@ -475,6 +468,78 @@ function KavitaClient:getContinuePoint(seriesId)
         query  = { seriesId = seriesId },
     })
     return data, code, headers, status, body
+end
+
+-- Fetch the next logical chapter from a series: GET /api/Reader/next-chapter
+-- Returns: chapterId (integer), code, headers, status, raw_body
+function KavitaClient:getNextChapter(seriesId, volumeId, currentChapterId)
+    if not seriesId or not volumeId or not currentChapterId then
+        logger.warn("KavitaClient:getNextChapter: seriesId, volumeId, and currentChapterId are required")
+        return nil, nil, nil, "seriesId, volumeId, and currentChapterId required", nil
+    end
+    local path = "/api/Reader/next-chapter"
+    -- Use apiRequest instead of apiJSON since response is plain text (number)
+    local code, headers, status, body = self:apiRequest(path, {
+        method = "GET",
+        query  = {
+            seriesId = seriesId,
+            volumeId = volumeId,
+            currentChapterId = currentChapterId,
+        },
+    })
+
+    -- Parse the body as a plain number
+    if type(code) == "number" and code >= 200 and code < 300 and body then
+        local chapter_id = tonumber(body)
+        if chapter_id then
+            return chapter_id, code, headers, status, body
+        else
+            logger.warn("KavitaClient:getNextChapter: failed to parse body as number:", body)
+            return nil, code, headers, "Invalid response body", body
+        end
+    end
+
+    return nil, code, headers, status, body
+end
+
+-- Fetch series cover image: GET /api/Image/series-cover?seriesId={id}&apiKey={key}
+-- Returns: raw image data (binary), code, headers, status
+function KavitaClient:getSeriesCover(seriesId)
+    logger.dbg("KavitaClient:getSeriesCover called for seriesId:", seriesId)
+
+    if not seriesId then
+        logger.warn("KavitaClient:getSeriesCover: seriesId is required")
+        return nil, -1, nil, "seriesId required"
+    end
+    if not self.api_key then
+        logger.warn("KavitaClient:getSeriesCover: api_key not set")
+        return nil, -1, nil, "api_key required"
+    end
+
+    local path = "/api/Image/series-cover"
+    logger.dbg("KavitaClient:getSeriesCover: requesting", path, "with seriesId:", seriesId)
+
+    local code, headers, status, body = self:apiRequest(path, {
+        method = "GET",
+        query  = {
+            seriesId = seriesId,
+            apiKey = self.api_key,
+        },
+    })
+
+    logger.dbg("KavitaClient:getSeriesCover: received response code:", code, "status:", status,
+              "body size:", body and #body or 0)
+
+    -- Return raw binary data for image
+    if type(code) == "number" and code >= 200 and code < 300 then
+        logger.info("KavitaClient:getSeriesCover: successfully fetched cover for series", seriesId,
+                   "size:", body and #body or 0, "bytes")
+        return body, code, headers, status
+    else
+        logger.warn("KavitaClient:getSeriesCover: failed to fetch cover for series", seriesId,
+                   "code:", code, "status:", status)
+        return nil, code, headers, status
+    end
 end
 
 return KavitaClient
