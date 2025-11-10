@@ -5,6 +5,7 @@ local logger = require("logger")
 local LuaSettings = require("luasettings")
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
+local NetworkMgr = require("ui/network/manager")
 local _ = require("gettext")
 
 local Kamare = WidgetContainer:extend{
@@ -138,6 +139,15 @@ end
 function Kamare:onFlushSettings()
     -- Always flush to ensure settings persistence
     self:saveSettings()
+end
+
+function Kamare:onResume()
+    logger.dbg("Kamare: onResume")
+
+    NetworkMgr:runWhenConnected(function()
+        -- WiFi is connected now
+        logger.dbg("Kamare: WiFi connected on resume, ready for streaming")
+    end)
 end
 
 return Kamare
