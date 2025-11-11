@@ -106,16 +106,16 @@ function KavitaBrowser:_applyCoverBrowserEnhancements()
     -- Override methods on this instance (same pattern as CoverBrowser does for History/Collections)
     -- Wrap updateItems to force recalculation when page_num is wrong
     local original_updateItems = self.CoverMenu.updateItems
-    self.updateItems = function(self, select_number, no_recalculate_dimen)
+    self.updateItems = function(cover_menu_self, select_number, no_recalculate_dimen)
         -- Force recalculation if page_num doesn't match expected value
-        if self.item_table and #self.item_table > 0 and self.perpage and self.perpage > 0 then
-            local expected_page_num = math.ceil(#self.item_table / self.perpage)
-            if self.page_num ~= expected_page_num then
+        if cover_menu_self.item_table and #cover_menu_self.item_table > 0 and cover_menu_self.perpage and cover_menu_self.perpage > 0 then
+            local expected_page_num = math.ceil(#cover_menu_self.item_table / cover_menu_self.perpage)
+            if cover_menu_self.page_num ~= expected_page_num then
                 no_recalculate_dimen = false
             end
         end
 
-        return original_updateItems(self, select_number, no_recalculate_dimen)
+        return original_updateItems(cover_menu_self, select_number, no_recalculate_dimen)
     end
 
     -- Wrap onCloseWidget to call CoverBrowser's cleanup
@@ -360,7 +360,7 @@ function KavitaBrowser:showDashboardAfterSelection(server_name)
     UIManager:show(loading)
     UIManager:forceRePaint()
 
-    local data, code, headers, status, body = KavitaClient:getDashboard()
+    local data, code, _, status, _ = KavitaClient:getDashboard()
 
     UIManager:close(loading)
 
@@ -422,7 +422,7 @@ function KavitaBrowser:performKavitaSearch(query)
     UIManager:show(loading)
     UIManager:forceRePaint()
 
-    local result, code, headers, status, body = KavitaClient:getSearch(query, false)
+    local result, code, _, status, _ = KavitaClient:getSearch(query, false)
 
     UIManager:close(loading)
 
@@ -600,7 +600,7 @@ function KavitaBrowser:showSeriesDetail(series_name, series_id, library_id, opts
     UIManager:show(loading)
     UIManager:forceRePaint()
 
-    local detail, code, headers, status, body = KavitaClient:getSeriesDetail(series_id)
+    local detail, code, _, status, _ = KavitaClient:getSeriesDetail(series_id)
 
     UIManager:close(loading)
 
@@ -709,7 +709,7 @@ function KavitaBrowser:showKavitaStream(stream_name)
     local has_more = true
 
     while has_more do
-        local data, code, headers, status, body = KavitaClient:getStreamSeries(stream_name, { PageNumber = page_num, PageSize = page_size })
+        local data, code, _, status, _ = KavitaClient:getStreamSeries(stream_name, { PageNumber = page_num, PageSize = page_size })
 
         if not data then
             UIManager:close(loading)
@@ -804,7 +804,7 @@ function KavitaBrowser:persistBearerToken(server_name, server_url, token)
     end
 
     local servers = self.kamare_settings:readSetting("servers", {}) or {}
-    local updated = false
+    local found = false
 
     if type(servers) == "table" then
         for i, s in ipairs(servers) do
@@ -812,11 +812,11 @@ function KavitaBrowser:persistBearerToken(server_name, server_url, token)
                 -- Update token and metadata
                 servers[i].bearer = token
                 servers[i].updated_at = os.time()
-                updated = true
+                found = true
                 break
             end
         end
-        if not updated then
+        if not found then
             -- Insert a new entry with the agreed nomenclature
             table.insert(servers, {
                 name = server_name,
@@ -824,7 +824,6 @@ function KavitaBrowser:persistBearerToken(server_name, server_url, token)
                 bearer = token,
                 updated_at = os.time(),
             })
-            updated = true
         end
     else
         servers = {
@@ -1024,11 +1023,6 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name)
     end
 
     -- Make sure client has bearer/base_url/api_key (authenticateAfterSelection sets those)
-    local ctx = {
-        series_id  = self.current_series_id,
-        library_id = self.current_series_library_id,
-        volume_id  = chapter.volumeId,
-    }
     local page_table = KavitaClient:streamChapter(chapter.id)
 
     -- Keep lazy 1-based images list; client converts to 0-based for API
@@ -1156,14 +1150,13 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name)
 
                 -- Get series detail to find the chapter
                 local sid = self.current_series_id
-                local lid = self.current_series_library_id
                 if not sid then
                     UIManager:close(loading)
                     UIManager:show(InfoMessage:new{ text = _("Cannot load next chapter: missing series info") })
                     return
                 end
 
-                local detail, code = KavitaClient:getSeriesDetail(sid)
+                local detail, _ = KavitaClient:getSeriesDetail(sid)
                 UIManager:close(loading)
 
                 if not detail then
@@ -1278,6 +1271,75 @@ end
 
 -- Menu action on item long-press (dialog Edit / Delete catalog)
 function KavitaBrowser:onMenuHold(item)
+    -- Handle series long-press for continue reading
+    if item.kavita_series and item.series then
+        local series = item.series
+        local sid = series.id or series.seriesId
+        local lid = series.libraryId or (series.library and series.library.id)
+
+        if not sid then
+            UIManager:show(InfoMessage:new{ text = _("Series ID not available") })
+            return true
+        end
+
+        local dialog
+        local buttons = {
+            {
+                {
+                    text = _("Continue Reading") .. " \u{25B6}",
+                    callback = function()
+                        UIManager:close(dialog)
+
+                        local loading = InfoMessage:new{ text = _("Loading..."), timeout = 0 }
+                        UIManager:show(loading)
+                        UIManager:forceRePaint()
+
+                        local chapter, _ = KavitaClient:getContinuePoint(sid)
+
+                        UIManager:close(loading)
+
+                        if not chapter then
+                            UIManager:show(InfoMessage:new{ text = _("Failed to get continue point") })
+                            return
+                        end
+
+                        self.current_series_id = sid
+                        self.current_series_library_id = lid
+                        self.current_series_names = {
+                            name = item.text,
+                            originalName = series.originalName or series.seriesName or series.name,
+                            localizedName = series.localizedName,
+                            author = series.author or series.authors or series.writers,
+                        }
+
+                        self:launchKavitaChapterViewer(chapter, item.text)
+                    end,
+                },
+                {
+                    text = _("View Series"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        self.current_series_names = {
+                            name = item.text,
+                            originalName = series.originalName or series.seriesName or series.name,
+                            localizedName = series.localizedName,
+                            author = series.author or series.authors or series.writers,
+                        }
+                        self:showSeriesDetail(item.text, sid, lid)
+                    end,
+                },
+            },
+        }
+
+        dialog = ButtonDialog:new{
+            title = item.text,
+            title_align = "center",
+            buttons = buttons,
+        }
+        UIManager:show(dialog)
+        return true
+    end
+
     -- Handle chapter/volume long-press for reading options
     if item.kavita_chapter and item.chapter and item.chapter.id then
         local chapter = item.chapter
@@ -1376,7 +1438,7 @@ function KavitaBrowser:onMenuHold(item)
                         seriesId  = self.current_series_id,
                         libraryId = self.current_series_library_id,
                     }
-                    local code, headers, status, body = KavitaClient:postReaderProgress(progress)
+                    local code, _, _, _ = KavitaClient:postReaderProgress(progress)
                     if code == 200 or code == 204 then
                         UIManager:show(InfoMessage:new{ text = _("Marked as read") })
                         -- Refresh the series view to update progress indicators
@@ -1510,7 +1572,7 @@ function KavitaBrowser:onMenuHold(item)
                         seriesId  = self.current_series_id,
                         libraryId = self.current_series_library_id,
                     }
-                    local code, headers, status, body = KavitaClient:postReaderProgress(progress)
+                    local code, _, _, _ = KavitaClient:postReaderProgress(progress)
                     if code == 200 or code == 204 then
                         UIManager:show(InfoMessage:new{ text = _("Marked as read") })
                         -- Refresh the series view to update progress indicators
