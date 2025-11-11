@@ -142,12 +142,12 @@ function Kamare:onFlushSettings()
 end
 
 function Kamare:onResume()
-    logger.dbg("Kamare: onResume")
-
-    NetworkMgr:runWhenConnected(function()
-        -- WiFi is connected now
-        logger.dbg("Kamare: WiFi connected on resume, ready for streaming")
-    end)
+    if self.browser then
+        NetworkMgr:runWhenConnected(function()
+            -- WiFi is connected now
+            logger.dbg("Kamare: WiFi connected on resume, ready for streaming")
+        end)
+    end
 end
 
 return Kamare
