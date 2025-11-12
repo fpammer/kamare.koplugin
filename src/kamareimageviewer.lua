@@ -570,6 +570,7 @@ function KamareImageViewer:getFooterState()
         is_scroll_mode = (self.view_mode == 1) or false,
         scroll_progress = scroll_progress,
         time_estimate = time_estimate,
+        is_rtl_mode = (self.view_mode == 2 and self.page_direction == 1) or false,
     }
 end
 
@@ -708,26 +709,12 @@ function KamareImageViewer:onTapMinibar()
 end
 
 function KamareImageViewer:onTapForward()
-    -- In dual-page RTL mode, forward (right side) goes to previous page
-    local is_rtl = BD.mirroredUILayout() or (self.view_mode == 2 and self.page_direction == 1)
-
-    if is_rtl then
-        self:onShowPrevImage()
-    else
-        self:onShowNextImage()
-    end
+    self:onShowNextImage()
     return true
 end
 
 function KamareImageViewer:onTapBackward()
-    -- In dual-page RTL mode, backward (left side) goes to next page
-    local is_rtl = BD.mirroredUILayout() or (self.view_mode == 2 and self.page_direction == 1)
-
-    if is_rtl then
-        self:onShowNextImage()
-    else
-        self:onShowPrevImage()
-    end
+    self:onShowPrevImage()
     return true
 end
 
@@ -1071,10 +1058,14 @@ end
 
 function KamareImageViewer:_scrollBy(delta)
     self:_setScrollOffset((self.scroll_offset or 0) + delta)
+    -- Force UI refresh for scroll mode
+    if self.view_mode == 1 then
+        UIManager:setDirty(self, "partial", self.main_frame.dimen)
+    end
 end
 
 function KamareImageViewer:_scrollStep(direction)
-    if not (self.scroll_mode and self.canvas and self.virtual_document) then
+    if not (self.view_mode == 1 and self.canvas and self.virtual_document) then
         return false
     end
 
@@ -1627,9 +1618,8 @@ function KamareImageViewer:switchToImageNum(page)
 end
 
 function KamareImageViewer:onShowNextImage()
-    -- In RTL dual-page mode in landscape, "next" in reading direction means going backward in page numbers
-    local is_landscape = Screen:getWidth() > Screen:getHeight()
-    local is_rtl = self.view_mode == 2 and self.page_direction == 1 and is_landscape
+    -- In RTL dual-page mode, "next" in reading direction means going backward in page numbers
+    local is_rtl = self.view_mode == 2 and self.page_direction == 1
 
     if is_rtl then
         return self:_showPrevImageInternal()
@@ -1639,9 +1629,8 @@ function KamareImageViewer:onShowNextImage()
 end
 
 function KamareImageViewer:onShowPrevImage()
-    -- In RTL dual-page mode in landscape, "prev" in reading direction means going forward in page numbers
-    local is_landscape = Screen:getWidth() > Screen:getHeight()
-    local is_rtl = self.view_mode == 2 and self.page_direction == 1 and is_landscape
+    -- In RTL dual-page mode, "prev" in reading direction means going forward in page numbers
+    local is_rtl = self.view_mode == 2 and self.page_direction == 1
 
     if is_rtl then
         return self:_showNextImageInternal()
@@ -1784,7 +1773,8 @@ function KamareImageViewer:_postViewProgress()
     if not (self.metadata and KavitaClient and KavitaClient.bearer) then return end
 
     local at_end = false
-    if self.scroll_mode and self._images_list_cur == self._images_list_nb and self.canvas then
+
+    if self.view_mode == 1 and self._images_list_cur == self._images_list_nb and self.canvas then
         local max_offset = self.canvas:getMaxScrollOffset() or 0
         if max_offset > 0 then
             at_end = math.abs((self.scroll_offset or 0) - max_offset) < 1

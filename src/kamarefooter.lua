@@ -93,6 +93,7 @@ function KamareFooter:ensureBuilt()
         ticks = nil,
         last = nil,
         initial_pos_marker = false,
+        fill_from_right = false,
     }
     self.progress_bar:updateStyle(true, self.settings.progress_style_thick_height)
 
@@ -301,6 +302,13 @@ function KamareFooter:updateProgressBar()
         return
     end
 
+    -- Update RTL direction for dual-page RTL mode
+    if self.state.is_rtl_mode then
+        self.progress_bar.fill_from_right = true
+    else
+        self.progress_bar.fill_from_right = false
+    end
+
     local progress
     if self.state.is_scroll_mode then
         progress = self.state.scroll_progress
@@ -321,6 +329,7 @@ function KamareFooter:update(state)
        self.state.scroll_progress ~= state.scroll_progress or
        self.state.time_estimate ~= state.time_estimate or
        self.state.is_scroll_mode ~= state.is_scroll_mode or
+       self.state.is_rtl_mode ~= state.is_rtl_mode or
        self.state.has_document ~= state.has_document then
         changed = true
     end

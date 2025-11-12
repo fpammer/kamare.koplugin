@@ -239,7 +239,7 @@ function VirtualPageCanvas:getViewportSize()
 end
 
 function VirtualPageCanvas:getVirtualHeight()
-    if self.mode ~= "scroll" or not self.document then
+    if self.view_mode ~= 1 or not self.document then
         return 0
     end
     if self._layout_dirty then
@@ -249,7 +249,7 @@ function VirtualPageCanvas:getVirtualHeight()
 end
 
 function VirtualPageCanvas:getMaxScrollOffset()
-    if self.mode ~= "scroll" then
+    if self.view_mode ~= 1 then
         return 0
     end
     local total_h = self:getVirtualHeight()
@@ -494,11 +494,11 @@ function VirtualPageCanvas:getDualPagePair(current_page)
 
     if current_page == 1 then
         if self.page_direction == 1 then
-            -- RTL: page 1 on left, empty on right
-            return 1, 0
-        else
-            -- LTR: empty on left, page 1 on right
+            -- RTL: empty on left, page 1 on right (manga style - start from right)
             return 0, 1
+        else
+            -- LTR: page 1 on left, empty on right
+            return 1, 0
         end
     end
 
@@ -506,11 +506,11 @@ function VirtualPageCanvas:getDualPagePair(current_page)
 
     if is_last_odd then
         if self.page_direction == 1 then
-            -- RTL: last page on left, empty on right
-            return current_page, 0
-        else
-            -- LTR: empty on left, last page on right
+            -- RTL: empty on left, last page on right
             return 0, current_page
+        else
+            -- LTR: last page on left, empty on right
+            return current_page, 0
         end
     end
 
