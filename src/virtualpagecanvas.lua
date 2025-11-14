@@ -486,26 +486,41 @@ function VirtualPageCanvas:getDualPagePair(current_page)
         return current_page, 0
     end
 
-    if not self.document._dual_page_layout then
-        if self.document._buildDualPageLayout then
-            self.document:_buildDualPageLayout(self.page_direction)
-        else
-            return current_page, 0
+    -- Pairs should already be built in document init
+    if not self.document._dual_page_pairs then
+        return current_page, 0
+    end
+
+    local pairs = self.document._dual_page_pairs
+    for i, pair in ipairs(pairs) do
+        local page1, page2 = pair[1], pair[2]
+
+        if current_page == page1 or current_page == page2 then
+            logger.warn(string.format("VPC:getDualPagePair page %d found in pairs[%d] {%d, %d}", current_page, i, page1, page2))
+
+            -- Check for landscape solo spreads (same non-zero page number)
+            if page1 == page2 and page1 > 0 then
+                logger.warn("VPC:getDualPagePair SOLO landscape display for page", current_page)
+                return current_page, -1  -- Signal solo landscape display
+            end
+
+            -- Apply RTL flipping for display
+            -- page_direction: 0 = LTR, 1 = RTL
+            local left_page, right_page
+            if self.page_direction == 1 then
+                -- RTL: swap pages (right page comes first in reading order)
+                left_page, right_page = page2, page1
+                logger.warn(string.format("VPC:getDualPagePair RTL mode, swapped to {%d, %d}", left_page, right_page))
+            else
+                -- LTR: keep physical order
+                left_page, right_page = page1, page2
+            end
+
+            return left_page, right_page
         end
     end
 
-    local pair = self.document._dual_page_layout[current_page]
-    if pair then
-        local left_page, right_page = pair[1], pair[2]
-
-        if left_page == right_page then
-            return current_page, -1  -- Signal solo display
-        end
-
-        return left_page, right_page
-    end
-
-    logger.warn("VPC:getDualPagePair", "No layout entry for page", current_page)
+    logger.warn("VPC:getDualPagePair No pair found for page", current_page)
     return current_page, 0
 end
 
@@ -668,90 +683,6 @@ function VirtualPageCanvas:_prepareLayout()
             self.document:_calculateVirtualLayout()
         end
     end
-end
-
-function VirtualPageCanvas:_renderPageSlice(page_info, zoom, slice_top_px, slice_height_px)
-
-    local page_num = page_info.page_num
-    local layout = page_info.layout
-
-    if not (page_num and layout) then
-        logger.warn("VPC:_renderPageSlice missing page_num or layout")
-        return nil
-    end
-
-
-    local image_zoom = zoom
-
-    local page_top = page_info.page_top or 0
-
-    -- Fallback to visible_* if caller didn't pass explicit slice px
-    local top_px = tonumber(slice_top_px)
-    local height_px = tonumber(slice_height_px)
-    if not (top_px and height_px) then
-        local vt = page_info.visible_top or page_top
-        local vb = page_info.visible_bottom or vt
-        top_px = math.floor(vt - page_top)
-        height_px = math.max(0, math.floor(vb - vt))
-    end
-
-
-    if not height_px or height_px <= 0 then
-        logger.warn("VPC:_renderPageSlice zero slice height (px)", "page", page_num, "top_px", top_px, "height_px", height_px)
-        return nil
-    end
-
-    -- Convert quantized zoom px back to native coords
-    local native_y = top_px / image_zoom
-    local native_h = height_px / image_zoom
-
-
-    local native_page_h = layout.native_height or 0
-    if native_page_h <= 0 then
-        logger.warn("VPC:_renderPageSlice invalid native height", "page", page_num)
-        return nil
-    end
-    if native_y >= native_page_h then
-        logger.warn("VPC:_renderPageSlice slice starts beyond page", "page", page_num, "native_y", native_y, "native_page_h", native_page_h)
-        return nil
-    end
-    if native_y + native_h > native_page_h then
-        native_h = native_page_h - native_y
-    end
-    if native_h <= 0 then
-        logger.warn("VPC:_renderPageSlice clamped to zero height", "page", page_num)
-        return nil
-    end
-
-
-    local rect = Geom:new{
-        x = 0,
-        y = native_y,
-        w = layout.native_width,
-        h = native_h,
-    }
-
-    local scaled_w = math.floor(layout.native_width * image_zoom)
-    local scaled_h = math.floor(native_h * image_zoom)
-
-
-    rect.scaled_rect = Geom:new{
-        x = 0,
-        y = 0,
-        w = scaled_w,
-        h = scaled_h,
-    }
-
-    local ok, slice = pcall(function()
-        return self.document:renderPage(page_num, rect, image_zoom, self.rotation, false)
-    end)
-
-    if ok and slice then
-        return slice
-    end
-
-    logger.warn("VPC:_renderPageSlice render failed", "page", page_num, "error", slice)
-    return nil
 end
 
 function VirtualPageCanvas:paintScroll(target, x, y, retry)

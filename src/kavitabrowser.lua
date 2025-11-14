@@ -362,7 +362,7 @@ function KavitaBrowser:showDashboardAfterSelection(server_name)
     UIManager:close(loading)
 
     if not data then
-        self:handleCatalogError("/api/Stream/dashboard", status or code)
+        self:handleCatalogError("dashboard", "/api/Stream/dashboard", status or code)
         return
     end
 
@@ -424,7 +424,7 @@ function KavitaBrowser:performKavitaSearch(query)
     UIManager:close(loading)
 
     if not result then
-        self:handleCatalogError("/api/Search/search", status or code)
+        self:handleCatalogError("search", "/api/Search/search", status or code)
         return
     end
 
@@ -576,21 +576,6 @@ function KavitaBrowser:buildKavitaChapterItems(chapters, kind)
     return items
 end
 
--- Parse virtual filepath to extract item type and ID
--- Returns: item_type ("series"|"volume"|"chapter"), item_id (number)
-function KavitaBrowser:_parseVirtualPath(filepath)
-    if not filepath then return nil, nil end
-
-    -- Format: "/kavita/{server}/{type}/{id}.kavita"
-    local item_type, item_id = filepath:match("/kavita/[^/]+/([^/]+)/(%d+)%.kavita")
-
-    if item_type and item_id then
-        return item_type, tonumber(item_id)
-    end
-
-    return nil, nil
-end
-
 -- Fetch SeriesDetail and display Volumes, then Chapters, then Specials
 function KavitaBrowser:showSeriesDetail(series_name, series_id, library_id, opts)
     local loading = InfoMessage:new{ text = _("Loading..."), timeout = 0 }
@@ -612,7 +597,7 @@ function KavitaBrowser:showSeriesDetail(series_name, series_id, library_id, opts
     end
 
     if not detail then
-        self:handleCatalogError("/api/Series/series-detail?seriesId=" .. tostring(series_id), status or code)
+        self:handleCatalogError("series", "/api/Series/series-detail?seriesId=" .. tostring(series_id), status or code)
         return
     end
 
@@ -710,7 +695,7 @@ function KavitaBrowser:showKavitaStream(stream_name)
 
         if not data then
             UIManager:close(loading)
-            self:handleCatalogError("/api/Stream/" .. tostring(stream_name), status or code)
+            self:handleCatalogError("stream", "/api/Stream/" .. tostring(stream_name), status or code)
             return
         end
 
@@ -1002,10 +987,24 @@ function KavitaBrowser:deleteCatalog(item)
 end
 
 -- Handle errors from catalog fetching
-function KavitaBrowser:handleCatalogError(item_url, error_msg)
+function KavitaBrowser:handleCatalogError(context, item_url, error_msg)
     logger.info("Cannot get catalog info from", item_url, error_msg)
+
+    local message
+    if context == "dashboard" then
+        message = _("Cannot load dashboard. Please check your connection.")
+    elseif context == "search" then
+        message = _("Search failed. Please try again.")
+    elseif context == "series" then
+        message = _("Cannot load series details. Please check your connection.")
+    elseif context == "stream" then
+        message = _("Cannot load content. Please check your connection.")
+    else
+        message = _("Cannot load data from server. Please check your connection.")
+    end
+
     UIManager:show(InfoMessage:new{
-        text = T(_("Cannot get catalog info from %1"), (item_url and BD.url(item_url) or "nil")),
+        text = message,
     })
 end
 
@@ -1015,7 +1014,8 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
 
     local pages = chapter.pages or (chapter.files and #chapter.files) or 0
     if pages <= 0 then
-        UIManager:show(InfoMessage:new{ text = _("No pages to display") })
+        local message = is_volume and _("This volume has no pages to display") or _("This chapter has no pages to display")
+        UIManager:show(InfoMessage:new{ text = message })
         return
     end
 
@@ -1247,7 +1247,7 @@ function KavitaBrowser:onMenuSelect(item)
         if ch and ch.id then
             self:launchKavitaChapterViewer(ch, self.catalog_title or self.current_server_name, true)
         else
-            UIManager:show(InfoMessage:new{ text = _("No chapters in this volume") })
+            UIManager:show(InfoMessage:new{ text = _("This volume has no chapters available.") })
         end
         return true
     end
@@ -1371,7 +1371,7 @@ function KavitaBrowser:onMenuHold(item)
         local chapter = item.chapter
         local pages = chapter.pages or (chapter.files and #chapter.files) or 0
         if pages <= 0 then
-            UIManager:show(InfoMessage:new{ text = _("No pages to display") })
+            UIManager:show(InfoMessage:new{ text = _("This chapter has no pages to display") })
             return true
         end
 
@@ -1499,13 +1499,13 @@ function KavitaBrowser:onMenuHold(item)
         local vol = item.volume
         local ch = (type(vol.chapters) == "table") and vol.chapters[1] or nil
         if not ch or not ch.id then
-            UIManager:show(InfoMessage:new{ text = _("No chapters in this volume") })
+            UIManager:show(InfoMessage:new{ text = _("This volume has no chapters available.") })
             return true
         end
 
         local pages = ch.pages or (ch.files and #ch.files) or 0
         if pages <= 0 then
-            UIManager:show(InfoMessage:new{ text = _("No pages to display") })
+            UIManager:show(InfoMessage:new{ text = _("This volume has no pages to display") })
             return true
         end
 

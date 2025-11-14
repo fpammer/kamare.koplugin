@@ -137,9 +137,12 @@ local function fetchKavitaMetadataFromItemTable(filepath, BookInfoManager)
     elseif item_type == "volume" and found_item.volume then
         local v = found_item.volume
         metadata.pages = v.pages or 0
-        -- Only show series name in mixed lists (streams), not in series detail view
+        metadata.series_index = v.number  -- Extract volume number
+        -- Set series name from browser context
+        metadata.series = browser.catalog_title or (browser.current_series_names and browser.current_series_names.name) or nil
+        -- Only show series name in authors field for mixed lists (streams), not in series detail view
         if not browser.current_series_id then
-            metadata.authors = browser.catalog_title or (browser.current_series_names and browser.current_series_names.name) or ""
+            metadata.authors = metadata.series or ""
         else
             metadata.authors = ""
         end
@@ -147,9 +150,12 @@ local function fetchKavitaMetadataFromItemTable(filepath, BookInfoManager)
     elseif item_type == "chapter" and found_item.chapter then
         local c = found_item.chapter
         metadata.pages = c.pages or 0
-        -- Only show series name in mixed lists (streams), not in series detail view
+        metadata.series_index = c.number  -- Extract chapter number
+        -- Set series name from browser context
+        metadata.series = browser.catalog_title or (browser.current_series_names and browser.current_series_names.name) or nil
+        -- Only show series name in authors field for mixed lists (streams), not in series detail view
         if not browser.current_series_id then
-            metadata.authors = browser.catalog_title or (browser.current_series_names and browser.current_series_names.name) or ""
+            metadata.authors = metadata.series or ""
         else
             metadata.authors = ""
         end
@@ -174,7 +180,14 @@ local function fetchKavitaMetadata(filepath, BookInfoManager)
         return fetchKavitaMetadataFromItemTable(filepath, BookInfoManager)
     end
 
-    -- For all types, fetch series metadata (volumes/chapters don't have separate metadata)
+    -- For volumes and chapters, use item_table since the API endpoints expect series IDs
+    -- and we have volume/chapter IDs. The item_table has all the info we need including number.
+    if item_type == "volume" or item_type == "chapter" then
+        logger.dbg("Kamare: Fetching volume/chapter metadata from item_table")
+        return fetchKavitaMetadataFromItemTable(filepath, BookInfoManager)
+    end
+
+    -- For series, fetch metadata from Kavita API
     local series_metadata, code = KavitaClient:getSeriesMetadata(item_id)
     if not series_metadata or code ~= 200 then
         logger.warn("Kamare: Failed to fetch series metadata for:", item_id, "code:", code)
@@ -217,13 +230,13 @@ local function fetchKavitaMetadata(filepath, BookInfoManager)
     end
     local keywords_str = table.concat(keywords, ", ")
 
-    -- Build metadata structure
+    -- Build metadata structure (for series only - no series_index for series itself)
     return {
         pages = series_dto.pages or 0,
         title = series_dto.localizedName or series_dto.name or "",
         authors = authors_str,
         series = series_dto.name or series_dto.localizedName,
-        series_index = nil,  -- TODO: extract from volume/chapter if needed
+        series_index = nil,  -- Series itself has no index
         language = series_metadata.language or "en",
         keywords = keywords_str ~= "" and keywords_str or nil,
         description = series_metadata.summary or nil,

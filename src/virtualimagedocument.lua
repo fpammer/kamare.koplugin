@@ -43,10 +43,12 @@ local VirtualImageDocument = Document:extend{
     _orientation_cache = nil,
 
     _dual_page_offset = nil,
-    _dual_page_layout = nil, -- Pre-calculated layout: [page_num] = {left, right}
+    _dual_page_pairs = nil, -- Pre-calculated pairs array: [index] = {left, right}
     content_type = "auto", -- "auto", "volume", or "chapter"
 
     tile_px = TILE_SIZE_PX, -- default tile size (px)
+
+    on_image_load_error = nil, -- Callback: function(pageno, error_msg)
 }
 
 local function isPositiveDimension(w, h)
@@ -128,6 +130,8 @@ function VirtualImageDocument:init()
 
     if self._pages > 0 then
         self:_preSplitPageTiles(1, 1.0, 0, nil, true)
+        -- Build dual-page layout once on init
+        self:_buildDualPageLayout()
     end
 end
 
@@ -338,125 +342,167 @@ function VirtualImageDocument:getDualPageOffset()
         return 0
     end
 
-    -- Scan first ~30 pages for landscape spreads
-    -- Spreads at even positions need no offset, odd positions need offset=1
-    local scan_limit = math.min(self._pages, 30)
-
-    for page = 2, scan_limit do
+    -- Scan ALL pages for landscape spreads (merged pages)
+    -- In physical books, spreads ALWAYS start at even pages
+    -- If first spread is at odd position, we need offset=1 to shift it to even
+    for page = 2, self._pages do
         if self:getPageOrientation(page) == 1 then
             if (page % 2) == 0 then
                 self._dual_page_offset = 0
+
                 return 0
             else
                 self._dual_page_offset = 1
+
                 return 1
             end
         end
     end
 
     self._dual_page_offset = 0
+
     return 0
 end
 
-function VirtualImageDocument:_buildDualPageLayout(page_direction)
-    -- Pre-calculate layout: layout[page] = {left, right}, 0=empty, {p,p}=landscape solo
-
-    if self._dual_page_layout then
-        return self._dual_page_layout
-    end
-
+-- Pre-calculate dual page pairs array: pairs[index] = {left, right}
+-- Pairs are built in physical order (ascending page numbers)
+function VirtualImageDocument:_buildDualPageLayout()
     local content_type = self.content_type or "auto"
-
-    local layout = {}
+    local pairs = {}
     local offset = self:getDualPageOffset()
     local page_count = self._pages
 
     local function is_landscape(page)
         if page < 1 or page > page_count then return false end
+
         return self:getPageOrientation(page) == 1
     end
 
-    local page = 1
-    local landscape_count = 0
     local is_chapter = (content_type == "chapter")
+    local page = 1
 
-    while page <= page_count do
-        if layout[page] then
-            page = page + 1
-        elseif is_landscape(page) then
-            layout[page] = {page, page}
-            landscape_count = landscape_count + 1
-            page = page + 1
-        elseif page == 1 and not is_chapter then
-            if page_direction == 1 then
-                layout[1] = {0, 1}
-            else
-                layout[1] = {1, 0}
-            end
+    if page == 1 and not is_chapter then
+        table.insert(pairs, {0, 1})
+        page = page + 1
 
-            page = page + 1
-        elseif page == 2 and offset == 1 and not is_chapter then
-            if page_direction == 1 then
-                layout[2] = {2, 0}
-            else
-                layout[2] = {0, 2}
-            end
-
-            page = page + 1
-        else
-            local virtual_page = page
-            if is_chapter then
-                virtual_page = page - 1
-            elseif offset == 1 and page > 1 then
-                virtual_page = page + 1
-            end
-            virtual_page = virtual_page + landscape_count
-
-            local page1, page2
-            local pair_partner = nil
-
-            if virtual_page % 2 == 0 then
-                local next_page = page + 1
-                if next_page <= page_count and not is_landscape(next_page) then
-                    page1, page2 = page, next_page
-                    pair_partner = next_page
-                else
-                    page1, page2 = page, 0
-                end
-            else
-                local prev_page = page - 1
-                if prev_page >= 1 and not is_landscape(prev_page) and layout[prev_page] then
-                    local prev_layout = layout[prev_page]
-                    local is_prev_solo = (prev_layout[1] == prev_layout[2])
-                    if not is_prev_solo then
-                        page = page + 1
-                        goto continue
-                    end
-                end
-                page1, page2 = page, 0
-            end
-
-            local left_page, right_page
-            if page_direction == 1 then
-                left_page, right_page = page2, page1
-            else
-                left_page, right_page = page1, page2
-            end
-
-            layout[page] = {left_page, right_page}
-
-            if pair_partner then
-                layout[pair_partner] = {left_page, right_page}
-            end
-
+        if offset == 1 then
+            table.insert(pairs, {0, 2})
             page = page + 1
         end
-        ::continue::
     end
 
-    self._dual_page_layout = layout
+    while page <= page_count do
+        if is_landscape(page) then
+            table.insert(pairs, {page, page})
+            page = page + 1
+        else
+            local next_page = page + 1
+            if next_page <= page_count and not is_landscape(next_page) then
+                table.insert(pairs, {page, next_page})
+                page = page + 2
+            else
+                table.insert(pairs, {page, 0})
+                page = page + 1
+            end
+        end
+    end
 
-    return layout
+    self._dual_page_pairs = pairs
+    return pairs
+end
+
+function VirtualImageDocument:getSpreadForPage(page)
+    if page < 1 or page > self._pages then
+        return page
+    end
+
+    if not self._dual_page_pairs then
+        return page
+    end
+    local pairs = self._dual_page_pairs
+
+    -- Find the pair that contains this page
+    for i, pair in ipairs(pairs) do
+        local left, right = pair[1], pair[2]
+
+        if page == left or page == right then
+            return page
+        elseif left > 0 and right > 0 and (page == left or page == right) then
+            -- This case handles when we find the exact page in a valid pair
+            return page
+        end
+    end
+
+    return page
+end
+
+function VirtualImageDocument:getNextSpreadPage(current_page)
+    if current_page < 1 or current_page > self._pages then
+        return current_page
+    end
+
+    if not self._dual_page_pairs then
+        return math.min(current_page + 1, self._pages)
+    end
+    local pairs = self._dual_page_pairs
+
+    for i, pair in ipairs(pairs) do
+        local page1, page2 = pair[1], pair[2]
+
+        if current_page == page1 or current_page == page2 then
+            local next_pair = pairs[i + 1]
+
+            if next_pair then
+                local next_page1, next_page2 = next_pair[1], next_pair[2]
+
+                if next_page1 > 0 then
+                    return next_page1
+                elseif next_page2 > 0 then
+                    return next_page2
+                end
+            end
+
+            return current_page
+        end
+    end
+
+    return math.min(current_page + 1, self._pages)
+end
+
+function VirtualImageDocument:getPrevSpreadPage(current_page)
+    if current_page < 1 or current_page > self._pages then
+        return current_page
+    end
+
+    if not self._dual_page_pairs then
+        return math.max(current_page - 1, 1)
+    end
+
+    local pairs = self._dual_page_pairs
+
+    -- Find the current spread
+    for i, pair in ipairs(pairs) do
+        local page1, page2 = pair[1], pair[2]
+
+        if current_page == page1 or current_page == page2 then
+            -- Found current spread, return first page of previous spread
+            local prev_pair = pairs[i - 1]
+            if prev_pair then
+                local prev_page1, prev_page2 = prev_pair[1], prev_pair[2]
+                -- Return the first non-zero page
+                if prev_page1 > 0 then
+                    return prev_page1
+                elseif prev_page2 > 0 then
+                    return prev_page2
+                end
+            end
+            -- No previous spread, stay on current page
+            return current_page
+        end
+    end
+
+    -- Not found in pairs, just decrement
+    return math.max(current_page - 1, 1)
 end
 
 function VirtualImageDocument:preloadDimensions(list)
@@ -772,6 +818,9 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation, page_mode
 
     local raw_data = self:_getRawImageData(pageno)
     if not raw_data then
+        if self.on_image_load_error then
+            self.on_image_load_error(pageno, "Failed to load image data")
+        end
         return nil
     end
 
@@ -781,6 +830,9 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation, page_mode
     local ok, full_bb = pcall(mupdf.renderImage, raw_data, #raw_data, render_w, render_h)
     if not ok or not full_bb then
         logger.warn("VID:renderPage renderImage failed", "page", pageno, "error", full_bb)
+        if self.on_image_load_error then
+            self.on_image_load_error(pageno, "Failed to render image")
+        end
         return nil
     end
 
@@ -939,7 +991,12 @@ function VirtualImageDocument:_preSplitPageTiles(pageno, zoom, rotation, tile_px
     end
 
     local raw_data = self:_getRawImageData(pageno)
-    if not raw_data then return end
+    if not raw_data then
+        if self.on_image_load_error then
+            self.on_image_load_error(pageno, "Failed to load image data")
+        end
+        return
+    end
 
     local cap_height = (page_mode == nil) or page_mode
     local render_w, render_h = self:_calculateRenderDimensions(native, cap_height)
@@ -947,6 +1004,9 @@ function VirtualImageDocument:_preSplitPageTiles(pageno, zoom, rotation, tile_px
     local ok, full_bb = pcall(mupdf.renderImage, raw_data, #raw_data, render_w, render_h)
     if not ok or not full_bb then
         logger.warn("VID:_preSplitPageTiles renderImage failed", "page", pageno, "error", full_bb)
+        if self.on_image_load_error then
+            self.on_image_load_error(pageno, "Failed to render image")
+        end
         return
     end
 
@@ -1105,8 +1165,6 @@ function VirtualImageDocument:drawPageTiled(target, x, y, rect, pageno, zoom, ro
 
                     if blit_w > 0 and blit_h > 0 then
                         target:blitFrom(ttile.bb, dst_x, dst_y, src_x, src_y, blit_w, blit_h)
-                    else
-                        logger.warn("VID:drawPageTiled SKIP blit", "tile", i, "w", w, "h", h)
                     end
                 end
             end
@@ -1118,7 +1176,6 @@ function VirtualImageDocument:drawPageTiled(target, x, y, rect, pageno, zoom, ro
         self:_endTileBatch()
     end
     if not ok then
-        logger.warn("VID:drawPageTiled error during render", "page", pageno, "error", err)
         return false
     end
 
