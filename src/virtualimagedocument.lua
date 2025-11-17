@@ -43,6 +43,7 @@ local VirtualImageDocument = Document:extend{
     _orientation_cache = nil,
 
     _dual_page_offset = nil,
+    _dual_page_layout = nil, -- Pre-calculated layout: [page_num] = {left, right}
     _dual_page_pairs = nil, -- Pre-calculated pairs array: [index] = {left, right}
     content_type = "auto", -- "auto", "volume", or "chapter"
 
@@ -1145,18 +1146,14 @@ function VirtualImageDocument:drawPageTiled(target, x, y, rect, pageno, zoom, ro
                     local native_src_x = overlap.x - actual_tile_rect.x
                     local native_src_y = overlap.y - actual_tile_rect.y
 
-                    local src_x = math.floor(native_src_x * zoom)
-                    local src_y = math.floor(native_src_y * zoom)
+                    local src_x = math.floor(native_src_x * zoom + 0.5)
+                    local src_y = math.floor(native_src_y * zoom + 0.5)
 
-                    local dst_x_start = x + math.floor((overlap.x - base_rect.x) * zoom)
-                    local dst_y_start = y + math.floor((overlap.y - base_rect.y) * zoom)
-                    local dst_x_end = x + math.floor((overlap.x + overlap.w - base_rect.x) * zoom)
-                    local dst_y_end = y + math.floor((overlap.y + overlap.h - base_rect.y) * zoom)
+                    local dst_x = x + math.floor((overlap.x - base_rect.x) * zoom + 0.5)
+                    local dst_y = y + math.floor((overlap.y - base_rect.y) * zoom + 0.5)
 
-                    local dst_x = dst_x_start
-                    local dst_y = dst_y_start
-                    local w = dst_x_end - dst_x_start
-                    local h = dst_y_end - dst_y_start
+                    local w = math.floor(overlap.w * zoom + 0.5)
+                    local h = math.floor(overlap.h * zoom + 0.5)
 
                     local src_w_avail = tile_bb_w - src_x
                     local src_h_avail = tile_bb_h - src_y
