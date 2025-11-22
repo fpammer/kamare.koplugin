@@ -1227,7 +1227,6 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
                     return
                 end
 
-                -- Launch the viewer for the next chapter
                 local sname = self.catalog_title
                     or (self.current_series_names and (self.current_series_names.localizedName or self.current_series_names.name))
                     or _("Series")
@@ -1236,9 +1235,12 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
         end,
     }
 
-    -- Close loading indicator before showing viewer
-    UIManager:close(loading)
+    -- Do initial prefetch
+    if viewer and viewer.virtual_document then
+        viewer:prefetchUpcomingTiles()
+    end
 
+    UIManager:close(loading)
     UIManager:show(viewer)
     return viewer
 end
