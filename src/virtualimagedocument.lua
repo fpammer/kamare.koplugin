@@ -828,7 +828,7 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation, page_mode
 
     local hash = self:_tileHash(pageno, zoom, rotation, self.gamma, native_rect)
 
-    local native_tile = VIDCache:getNativeTile(hash, true)
+    local native_tile = VIDCache:getNativeTile(hash)
     if native_tile then
         return self:_scaleToZoom(native_tile, zoom, rotation, clip_rect)
     end
@@ -877,9 +877,15 @@ function VirtualImageDocument:renderPage(pageno, rect, zoom, rotation, page_mode
         bb = tile_bb,
     }
     tile.size = tonumber(tile_bb.stride) * tile_bb.h + 512
-    -- Store render scale for correct zoom scaling later
     tile.render_scale_x = render_scale_x
     tile.render_scale_y = render_scale_y
+
+    tile.onFree = function(self)
+        if self.bb and self.bb.free then
+            self.bb:free()
+            self.bb = nil
+        end
+    end
 
     VIDCache:setNativeTile(hash, tile, tile.size)
 
@@ -968,6 +974,13 @@ function VirtualImageDocument:_scaleToZoom(native_tile, zoom, rotation, clip_rec
     scaled_tile.render_scale_x = zoom
     scaled_tile.render_scale_y = zoom
 
+    scaled_tile.onFree = function(self)
+        if self.bb and self.bb.free then
+            self.bb:free()
+            self.bb = nil
+        end
+    end
+
     return scaled_tile
 end
 
@@ -1004,7 +1017,7 @@ function VirtualImageDocument:_preSplitPageTiles(pageno, zoom, rotation, tile_px
 
     for _, t in ipairs(tiles) do
         local key = self:_tileHash(pageno, zoom, rotation, self.gamma, t)
-        local exists = VIDCache:getNativeTile(key, true)
+        local exists = VIDCache:getNativeTile(key)
         if not (exists and exists.bb) then
             table.insert(missing, t)
         end
@@ -1052,6 +1065,13 @@ function VirtualImageDocument:_preSplitPageTiles(pageno, zoom, rotation, tile_px
             tile.size = tonumber(tile_bb.stride) * tile_bb.h + 512
             tile.render_scale_x = render_scale_x
             tile.render_scale_y = render_scale_y
+
+            tile.onFree = function(self)
+                if self.bb and self.bb.free then
+                    self.bb:free()
+                    self.bb = nil
+                end
+            end
 
             local key = self:_tileHash(pageno, zoom, rotation, self.gamma, t)
             VIDCache:setNativeTile(key, tile, tile.size)
@@ -1111,7 +1131,7 @@ function VirtualImageDocument:drawPageTiled(target, x, y, rect, pageno, zoom, ro
 
     for _, t in ipairs(tiles) do
         local key = self:_tileHash(pageno, zoom, rotation, self.gamma, t)
-        if not VIDCache:getNativeTile(key, true) then
+        if not VIDCache:getNativeTile(key) then
             any_missing = true
         else
             cached_count = cached_count + 1
@@ -1128,7 +1148,7 @@ function VirtualImageDocument:drawPageTiled(target, x, y, rect, pageno, zoom, ro
         local probe_tiles = self:_computeTileRects(prefetch_rect, tp)
         for _, t in ipairs(probe_tiles) do
             local key = self:_tileHash(pageno, zoom, rotation, self.gamma, t)
-            local hit = VIDCache:getNativeTile(key, true)
+            local hit = VIDCache:getNativeTile(key)
             if not (hit and hit.bb) then
                 need_batch = true
                 break
@@ -1147,7 +1167,7 @@ function VirtualImageDocument:drawPageTiled(target, x, y, rect, pageno, zoom, ro
     local ok, err = pcall(function()
         for i, t in ipairs(tiles) do
             local key = self:_tileHash(pageno, zoom, rotation, self.gamma, t)
-            local ttile = VIDCache:getNativeTile(key, true)
+            local ttile = VIDCache:getNativeTile(key)
             if ttile and ttile.bb then
                 local tile_bb = ttile.bb
                 local tile_rect = ttile.excerpt

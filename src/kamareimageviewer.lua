@@ -1296,6 +1296,28 @@ function KamareImageViewer:updateImageOnly()
     self:_updateCanvasState()
 end
 
+function KamareImageViewer:estimatePageTileCount(pageno, zoom, rotation)
+    local native_dims = self.virtual_document:getNativePageDimensions(pageno)
+    if not native_dims or native_dims.w <= 0 or native_dims.h <= 0 then
+        return 1  -- Default estimate for invalid pages
+    end
+
+    local render_w, render_h = self.virtual_document:_calculateRenderDimensions(native_dims)
+
+    -- Apply rotation
+    if rotation == 90 or rotation == 270 then
+        render_w, render_h = render_h, render_w
+    end
+
+    -- Calculate tile grid dimensions
+    local tile_px = self.virtual_document.tile_px or 1024
+    local tiles_x = math.ceil(render_w / tile_px)
+    local tiles_y = math.ceil(render_h / tile_px)
+    local tile_count = tiles_x * tiles_y
+
+    return tile_count
+end
+
 function KamareImageViewer:calculateAdaptivePrefetch()
     -- Initial load: prefetch immediately (1 page for continuous mode, 3 for page modes)
     if self._images_list_cur <= 1 and not self._initial_prefetch_done then
@@ -1306,24 +1328,51 @@ function KamareImageViewer:calculateAdaptivePrefetch()
     local zoom = self:getCurrentZoom()
     local rotation = self:_getRotationAngle()
 
-    -- Continuous scroll mode: ensure prefetch won't evict current page
+    -- Continuous scroll mode: tile-budget prefetch strategy
     if self.view_mode == 1 then
         local next_page = self._images_list_cur + 1
         if next_page > self._images_list_nb then
             return 0
         end
 
-        local native_dims = self.virtual_document:getNativePageDimensions(next_page)
-        if native_dims and native_dims.w > 0 then
-            local first_tile = Geom:new{x=0, y=0, w=1024, h=1024}
-            local hash = self.virtual_document:_tileHash(next_page, zoom, rotation,
-                                                         self.virtual_document.gamma, first_tile)
-            if VIDCache:getNativeTile(hash) then
-                return 0
+        -- Tile budget: prefetch pages until reaching ~12 tiles (~36-48MB)
+        local TILE_BUDGET = 12
+        local accumulated_tiles = 0
+        local pages_to_prefetch = 0
+
+        for i = 0, 15 do  -- Scan up to 15 pages ahead
+            local check_page = next_page + i
+            if check_page > self._images_list_nb then
+                break
+            end
+
+            -- Check if already cached
+            local is_cached = false
+            local native_dims = self.virtual_document:getNativePageDimensions(check_page)
+            if native_dims and native_dims.w > 0 then
+                local first_tile = Geom:new{x=0, y=0, w=1024, h=1024}
+                local hash = self.virtual_document:_tileHash(check_page, zoom, rotation,
+                                                             self.virtual_document.gamma, first_tile)
+                if VIDCache:getNativeTile(hash) then
+                    is_cached = true
+                end
+            end
+
+            if not is_cached then
+                -- Estimate tiles for this page
+                local tile_count = self:estimatePageTileCount(check_page, zoom, rotation)
+
+                -- Check if adding this page would exceed budget
+                if accumulated_tiles + tile_count > TILE_BUDGET then
+                    break  -- Budget exhausted
+                end
+
+                accumulated_tiles = accumulated_tiles + tile_count
+                pages_to_prefetch = pages_to_prefetch + 1
             end
         end
 
-        return 1
+        return pages_to_prefetch
     end
 
     -- Page modes (single/dual): check buffer
