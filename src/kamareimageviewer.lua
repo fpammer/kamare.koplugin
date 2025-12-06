@@ -1760,6 +1760,10 @@ function KamareImageViewer:switchToImageNum(page)
     end
 
     self:updateImageOnly()
+
+    -- Mark canvas region as dirty after image update
+    UIManager:setDirty(self, "partial", self.canvas.dimen)
+
     self:updateFooter()
 
     UIManager:nextTick(function()
