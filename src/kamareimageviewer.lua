@@ -132,7 +132,7 @@ function KamareImageViewer:init()
     self:_initCanvas()
     self:_setupStatisticsInterface()
 
-    self.align = "center"
+    self.align = "left"
     self.region = Geom:new{ x = 0, y = 0, w = Screen:getWidth(), h = Screen:getHeight() }
 
     self:_updateDimensions()
