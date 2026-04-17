@@ -33,7 +33,7 @@ local KamareImageViewer = InputContainer:extend{
     images_list_data = nil,
     images_list_nb = nil,
 
-    fullscreen = false,
+    fullscreen = true,
     width = nil,
     height = nil,
     rotated = false,
@@ -64,6 +64,7 @@ local KamareImageViewer = InputContainer:extend{
     background_color = 1, -- 0 = black, 1 = white
 
     _failed_image_loads = {}, -- Track failed image pages to show error toast
+    _pending_page_direction = nil, -- true=forward(top), false=backward(bottom), nil=no reposition
 
     footer_settings = {
         enabled = true,
@@ -158,6 +159,8 @@ function KamareImageViewer:init()
 
     if self.view_mode == 1 then
         self._pending_scroll_page = self._images_list_cur
+    else
+        self._pending_page_direction = true
     end
 
     if self.virtual_document and self._images_list_nb > 1 then
@@ -460,6 +463,7 @@ function KamareImageViewer:setZoomMode(mode)
     if changed then
         self.zoom_mode = mode
         self._pending_scroll_page = self._images_list_cur
+        self._pending_page_direction = true
     end
 
     self.configurable.zoom_mode_type = self.zoom_mode
@@ -805,6 +809,7 @@ function KamareImageViewer:onConfigCloseCallback()
         if new_mode ~= self.view_mode then
             self.view_mode = new_mode
             self._pending_scroll_page = self._images_list_cur
+            self._pending_page_direction = true
             if self.view_mode ~= 1 then
                 self.scroll_offset = 0
                 if self.canvas and self.zoom_mode == 0 then
@@ -934,6 +939,7 @@ function KamareImageViewer:onSetViewMode(value)
     self.view_mode = mode
     self.configurable.view_mode = mode
     self._pending_scroll_page = self._images_list_cur
+    self._pending_page_direction = true
 
     if self.virtual_document then
         self.virtual_document:clearCache()
@@ -1294,7 +1300,10 @@ function KamareImageViewer:_updateCanvasState()
         self:updateFooter()
     else
         self.scroll_offset = 0
-        if self.zoom_mode == 0 then
+        if self._pending_page_direction ~= nil then
+            self:_applyPagePosition(page, self._pending_page_direction)
+            self._pending_page_direction = nil
+        elseif self.zoom_mode == 0 then
             self.canvas:setCenter(0.5, 0.5)
         end
         self:updateFooter()
@@ -1704,6 +1713,47 @@ function KamareImageViewer:_panWithinPage(direction)
     return false
 end
 
+function KamareImageViewer:_applyPagePosition(page, moving_forward)
+    if self.view_mode == 1 then return end
+    if not (self.canvas and self.virtual_document) then return end
+
+    if self.zoom_mode == 0 then
+        self.canvas:setCenter(0.5, 0.5)
+        return
+    end
+
+    local viewport_w, viewport_h = self.canvas:getViewportSize()
+    local dims = self.virtual_document:getNativePageDimensions(page)
+    if not (dims and viewport_w > 0 and viewport_h > 0) then return end
+
+    local zoom = self:getCurrentZoom()
+    local rotation = self:_getRotationAngle()
+    local page_w, page_h = dims.w, dims.h
+    if rotation % 180 ~= 0 then
+        page_w, page_h = page_h, page_w
+    end
+
+    if self.zoom_mode == 1 then
+        local scaled_h = page_h * zoom
+        if scaled_h > viewport_h then
+            local min_y = viewport_h / (2 * scaled_h)
+            local max_y = 1.0 - min_y
+            self.canvas:setCenter(0.5, moving_forward and min_y or max_y)
+        else
+            self.canvas:setCenter(0.5, 0.5)
+        end
+    elseif self.zoom_mode == 2 then
+        local scaled_w = page_w * zoom
+        if scaled_w > viewport_w then
+            local min_x = viewport_w / (2 * scaled_w)
+            local max_x = 1.0 - min_x
+            self.canvas:setCenter(moving_forward and min_x or max_x, 0.5)
+        else
+            self.canvas:setCenter(0.5, 0.5)
+        end
+    end
+end
+
 function KamareImageViewer:switchToImageNum(page)
     self:recordViewingTimeIfValid()
     page = Math.clamp(page, 1, self._images_list_nb)
@@ -1736,43 +1786,7 @@ function KamareImageViewer:switchToImageNum(page)
         self:_scrollToPage(page)
     else
         self.scroll_offset = 0
-
-        if self.canvas and (self.zoom_mode == 1 or self.zoom_mode == 2) then
-            local viewport_w, viewport_h = self.canvas:getViewportSize()
-            local dims = self.virtual_document:getNativePageDimensions(page)
-
-            if dims and viewport_w > 0 and viewport_h > 0 then
-                local zoom = self:getCurrentZoom()
-                local rotation = self:_getRotationAngle()
-                local page_w = dims.w
-                local page_h = dims.h
-                if rotation % 180 ~= 0 then
-                    page_w, page_h = page_h, page_w
-                end
-
-                if self.zoom_mode == 1 then
-                    local scaled_h = page_h * zoom
-                    if scaled_h > viewport_h then
-                        local min_y = viewport_h / (2 * scaled_h)
-                        local max_y = 1.0 - min_y
-                        local new_y = moving_forward and min_y or max_y
-                        self.canvas:setCenter(0.5, new_y)
-                    else
-                        self.canvas:setCenter(0.5, 0.5)
-                    end
-                elseif self.zoom_mode == 2 then
-                    local scaled_w = page_w * zoom
-                    if scaled_w > viewport_w then
-                        local min_x = viewport_w / (2 * scaled_w)
-                        local max_x = 1.0 - min_x
-                        local new_x = moving_forward and min_x or max_x
-                        self.canvas:setCenter(new_x, 0.5)
-                    else
-                        self.canvas:setCenter(0.5, 0.5)
-                    end
-                end
-            end
-        end
+        self._pending_page_direction = moving_forward
     end
 
     self:updateImageOnly()
