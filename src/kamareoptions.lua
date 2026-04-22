@@ -187,11 +187,22 @@ local KamareOptions = {
                 help_text = _([[Choose what information to display in the footer.]]),
             },
             {
+                name = "chapter_end_behavior",
+                name_text = _("Chapter End"),
+                toggle = {_("Stop"), _("Ask"), _("Auto")},
+                values = {0, 1, 2},
+                default_value = 1,
+                event = "SetChapterEndBehavior",
+                args = {0, 1, 2},
+                help_text = _([[Choose what happens when you reach the end of a chapter: 'Stop' stays on the last page, 'Ask' shows a dialog to continue or close, 'Auto' automatically continues to the next chapter.]]),
+            },
+            {
                 name = "frontlight",
                 name_text = _("Frontlight"),
                 toggle = { _("Adjust") },
                 values = { 0 },
                 event = "ShowFrontlight",
+                help_text = _([[Open the frontlight controls to adjust brightness and warmth.]]),
                 enabled_func = function() return Device:hasFrontlight() end,
             }
         }

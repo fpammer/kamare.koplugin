@@ -63,6 +63,8 @@ local KamareImageViewer = InputContainer:extend{
     page_padding = 0, -- uniform padding on all sides
     background_color = 1, -- 0 = black, 1 = white
 
+    chapter_end_behavior = 1, -- 0 = stop at end, 1 = ask to continue, 2 = continue without asking
+
     _failed_image_loads = {}, -- Track failed image pages to show error toast
     _pending_page_direction = nil, -- true=forward(top), false=backward(bottom), nil=no reposition
 
@@ -404,6 +406,7 @@ function KamareImageViewer:loadSettings()
     self.configurable.render_quality = self.render_quality or -1
     self.configurable.background_color = self.background_color
     self.configurable.rotation_lock = false
+    self.configurable.chapter_end_behavior = self.chapter_end_behavior
 
     self.configurable:loadSettings(self.kamare_settings, self.options.prefix .. "_")
 
@@ -419,6 +422,7 @@ function KamareImageViewer:loadSettings()
     self.render_quality = self.configurable.render_quality or -1
     self.background_color = self.configurable.background_color or 1
     self.rotation_locked = self.configurable.rotation_lock or false
+    self.chapter_end_behavior = self.configurable.chapter_end_behavior or 1
 
     self:syncAndSaveSettings()
 end
@@ -441,6 +445,7 @@ function KamareImageViewer:syncAndSaveSettings()
     self.configurable.render_quality = self.render_quality
     self.configurable.background_color = self.background_color
     self.configurable.rotation_lock = self.rotation_locked
+    self.configurable.chapter_end_behavior = self.chapter_end_behavior
 
     self.configurable:saveSettings(self.kamare_settings, self.options.prefix .. "_")
 end
@@ -780,6 +785,7 @@ function KamareImageViewer:onShowConfigMenu()
     self.configurable.page_padding = self.page_padding
     self.configurable.background_color = self.background_color
     self.configurable.rotation_lock = self.rotation_locked
+    self.configurable.chapter_end_behavior = self.chapter_end_behavior
 
     self.config_dialog = ConfigDialog:new{
         document = nil,
@@ -1904,6 +1910,10 @@ end
 function KamareImageViewer:_checkAndOfferNextChapter()
     if not self.metadata then return end
 
+    if self.chapter_end_behavior == 0 then
+        return
+    end
+
     local seriesId = self.metadata.seriesId or self.metadata.series_id
     local volumeId = self.metadata.volumeId or self.metadata.volume_id
     local currentChapterId = self.metadata.chapterId or self.metadata.chapter_id
@@ -1913,27 +1923,48 @@ function KamareImageViewer:_checkAndOfferNextChapter()
         return
     end
 
+    local is_auto = self.chapter_end_behavior == 2
+
     UIManager:nextTick(function()
         local nextChapterId, code = KavitaClient:getNextChapter(seriesId, volumeId, currentChapterId)
 
-        if nextChapterId == -1 or not nextChapterId or type(code) ~= "number" or code < 200 or code >= 300 then
-            self.next_chapter_dialog = ButtonDialog:new{
-                title = _("You've reached the end of the series"),
-                title_align = "center",
-                buttons = {
-                    {
+        local no_next = nextChapterId == -1 or not nextChapterId or type(code) ~= "number" or code < 200 or code >= 300
+
+        if no_next then
+            if is_auto then
+                UIManager:show(InfoMessage:new{
+                    text = _("You've reached the end of the series"),
+                    timeout = 3,
+                })
+            else
+                self.next_chapter_dialog = ButtonDialog:new{
+                    title = _("You've reached the end of the series"),
+                    title_align = "center",
+                    buttons = {
                         {
-                            text = _("Close"),
-                            callback = function()
-                                UIManager:close(self.next_chapter_dialog)
-                                self.next_chapter_dialog = nil
-                                self:onClose()
-                            end,
+                            {
+                                text = _("Close"),
+                                callback = function()
+                                    UIManager:close(self.next_chapter_dialog)
+                                    self.next_chapter_dialog = nil
+                                    self:onClose()
+                                end,
+                            },
                         },
                     },
-                },
-            }
-            UIManager:show(self.next_chapter_dialog)
+                }
+                UIManager:show(self.next_chapter_dialog)
+            end
+            return
+        end
+
+        if is_auto then
+            if self.on_next_chapter_callback then
+                self.on_next_chapter_callback(nextChapterId)
+            end
+
+            self:onClose()
+
             return
         end
 
@@ -2123,6 +2154,16 @@ function KamareImageViewer:onSetRotationLock(locked)
     else
         logger.info("KamareImageViewer: Rotation unlocked")
     end
+    return true
+end
+
+function KamareImageViewer:onSetChapterEndBehavior(value)
+    local v = tonumber(value)
+    if not v then return false end
+    v = Math.clamp(v, 0, 2)
+    self.chapter_end_behavior = v
+    self.configurable.chapter_end_behavior = v
+    self:syncAndSaveSettings()
     return true
 end
 
