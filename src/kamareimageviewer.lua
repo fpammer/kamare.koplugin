@@ -27,6 +27,7 @@ local VIDCache = require("virtualimagedocumentcache")
 local InfoMessage = require("ui/widget/infomessage")
 local FFIUtil = require("ffi/util")
 local _ = require("gettext")
+local Utils = require("kamareutils")
 local T = FFIUtil.template
 
 local KamareImageViewer = InputContainer:extend{
@@ -281,9 +282,9 @@ function KamareImageViewer:_setupStatisticsInterface()
 
     local stats_data = {
         performance_in_pages = {},
-        title = self.metadata and self.metadata.localizedName or self.title or "Unknown",
+        title = Utils.resolveTitle(self.metadata, self.title),
         authors = self.metadata and self.metadata.author or "",
-        series = self.metadata and self.metadata.seriesName or "",
+        series = self.metadata and Utils.firstNonEmpty(self.metadata.seriesName) or "",
     }
 
     local doc_settings = {
@@ -314,10 +315,10 @@ function KamareImageViewer:_setupStatisticsInterface()
     self.ui.doc_settings = doc_settings
 
     local doc_props = {
-        title = self.metadata and self.metadata.localizedName or self.title or "Unknown",
-        display_title = self.metadata and self.metadata.localizedName or self.title or "Unknown",
+        title = Utils.resolveTitle(self.metadata, self.title),
+        display_title = Utils.resolveTitle(self.metadata, self.title),
         authors = self.metadata and self.metadata.author or "",
-        series = self.metadata and self.metadata.seriesName or "",
+        series = self.metadata and Utils.firstNonEmpty(self.metadata.seriesName) or "",
         series_index = self.metadata and self.metadata.volumeNumber or nil,
         language = "N/A",
         pages = self._images_list_nb,
@@ -503,17 +504,22 @@ function KamareImageViewer:registerKeyEvents()
 end
 
 function KamareImageViewer:setupTitleBar()
-    local title = self.title or _("Images")
+    local title
     local subtitle
 
     if self.metadata then
-        title = self.metadata.seriesName
-            or self.metadata.localizedName
-            or self.metadata.originalName
-            or title
+        title = Utils.firstNonEmpty(
+            self.metadata.seriesName,
+            self.metadata.localizedName,
+            self.metadata.originalName,
+            self.title,
+            _("Images")
+        )
         if self.metadata.author then
             subtitle = T(_("by %1"), self.metadata.author)
         end
+    else
+        title = self.title or _("Images")
     end
 
     self.title_bar = TitleBar:new{

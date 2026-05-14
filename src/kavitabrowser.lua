@@ -11,6 +11,7 @@ local ffiUtil = require("ffi/util")
 local logger = require("logger")
 local KamareImageViewer = require("kamareimageviewer")
 local _ = require("gettext")
+local Utils = require("kamareutils")
 local T = ffiUtil.template
 
 -- Progress indicator for read status
@@ -198,13 +199,13 @@ function KavitaBrowser:_applyCoverBrowserEnhancements()
             if kavita_item then
                 -- Check for series first (for stream lists like On Deck, Recently Updated, etc.)
                 if kavita_item.series then
-                    pagesRead = kavita_item.series.pagesRead or kavita_item.series.pageRead
+                    pagesRead = kavita_item.series.pagesRead
                     pages = kavita_item.series.pages
                 elseif kavita_item.volume then
-                    pagesRead = kavita_item.volume.pagesRead or kavita_item.volume.pageRead
+                    pagesRead = kavita_item.volume.pagesRead
                     pages = kavita_item.volume.pages
                 elseif kavita_item.chapter then
-                    pagesRead = kavita_item.chapter.pagesRead or kavita_item.chapter.pageRead
+                    pagesRead = kavita_item.chapter.pagesRead
                     pages = kavita_item.chapter.pages
                 end
             end
@@ -306,11 +307,11 @@ function KavitaBrowser:buildKavitaDashboardItems(dashboard)
                 name = _("Newly Added")
             elseif stream_type == 4 then
                 api_name = "smart-filter"
-                name = original_name ~= "" and original_name or _("Smart Filter")
+                name = Utils.firstNonEmpty(original_name, _("Smart Filter"))
             else
                 -- Unknown stream type - use name as-is
                 api_name = original_name
-                name = original_name ~= "" and original_name or _("Unnamed")
+                name = Utils.firstNonEmpty(original_name, _("Unnamed"))
             end
 
             local item = {
@@ -455,7 +456,7 @@ function KavitaBrowser:buildKavitaSeriesItems(series_list)
     local items = {}
     if type(series_list) == "table" then
         for i, s in ipairs(series_list) do
-            local name = s.localizedName or s.name or s.originalName or s.seriesName or s.title or _("Unnamed series")
+            local name = Utils.firstNonEmpty(s.localizedName, s.name, s.originalName, s.seriesName, s.title, _("Unnamed series"))
             -- Note: SeriesDto doesn't include author/writer info. That's only available
             -- in SeriesDetailDto via chapters. To avoid showing library name as "author",
             -- we leave it empty for series lists.
@@ -487,19 +488,8 @@ function KavitaBrowser:buildKavitaVolumeItems(volumes)
     local items = {}
     if type(volumes) == "table" then
         for _, v in ipairs(volumes) do
-            local vol_prefix = v.number and ("Volume " .. tostring(v.number)) or nil
-            local name
-            if v.name and v.name ~= "" then
-                local lower = v.name:lower()
-                if not (lower:find("vol") or lower:find("volume")) and vol_prefix then
-                    name = vol_prefix .. ": " .. v.name
-                else
-                    name = v.name
-                end
-            else
-                name = vol_prefix or ("Volume #" .. tostring(v.id or "?"))
-            end
-            local read = v.pagesRead or v.pageRead
+            local name = Utils.buildVolumeTitle(v)
+            local read = v.pagesRead
             local total = v.pages
             local subtitle = (total and read) and (tostring(read) .. "/" .. tostring(total) .. " pages") or nil
             local mandatory = progress_icon(read, total)
@@ -530,22 +520,10 @@ function KavitaBrowser:buildKavitaChapterItems(chapters, kind)
     local items = {}
     if type(chapters) == "table" then
         for __, c in ipairs(chapters) do
-            local ch_prefix = c.number and ("Ch. " .. tostring(c.number)) or nil
-            local base
-
-            if c.titleName and c.titleName ~= "" then
-                local lower = c.titleName:lower()
-                if not (lower:find("ch") or lower:find("chap") or lower:find("chapter") or lower:find("vol") or lower:find("volume")) and ch_prefix then
-                    base = ch_prefix .. ": " .. c.titleName
-                else
-                    base = c.titleName
-                end
-            else
-                base = c.title or c.range or ch_prefix or ("Chapter #" .. tostring(c.id or "?"))
-            end
+            local base = Utils.buildChapterTitle(c)
 
             local name = base
-            local read = c.pagesRead or c.pageRead
+            local read = c.pagesRead
             local total = c.pages
             local subtitle
             if total and read then
@@ -610,34 +588,18 @@ function KavitaBrowser:showSeriesDetail(series_name, series_id, library_id, opts
     self.catalog_title = series_name or _("Series")
     self.search_url = nil
 
-    -- Derive subtitle from writers of the first available item (prefer first volume's first chapter)
-    local function extractWritersFromChapter(ch)
-        local names = {}
-        if ch and type(ch.writers) == "table" then
-            for _, p in ipairs(ch.writers) do
-                if type(p) == "table" and p.name then
-                    table.insert(names, p.name)
-                elseif type(p) == "string" then
-                    table.insert(names, p)
-                end
-            end
-        end
-        if #names > 0 then
-            return table.concat(names, ", ")
-        end
-    end
     local subtitle
     if detail.volumes and type(detail.volumes) == "table" and detail.volumes[1] then
         local v = detail.volumes[1]
         if v.chapters and type(v.chapters) == "table" and v.chapters[1] then
-            subtitle = extractWritersFromChapter(v.chapters[1])
+            subtitle = Utils.joinPersonNames(v.chapters[1].writers)
         end
     end
     if not subtitle and detail.chapters and type(detail.chapters) == "table" and detail.chapters[1] then
-        subtitle = extractWritersFromChapter(detail.chapters[1])
+        subtitle = Utils.joinPersonNames(detail.chapters[1].writers)
     end
     if not subtitle and detail.specials and type(detail.specials) == "table" and detail.specials[1] then
-        subtitle = extractWritersFromChapter(detail.specials[1])
+        subtitle = Utils.joinPersonNames(detail.specials[1].writers)
     end
     self.catalog_author = subtitle
     -- Keep series naming/author for the reader overlay
@@ -647,9 +609,9 @@ function KavitaBrowser:showSeriesDetail(series_name, series_id, library_id, opts
     end
     -- Try to enrich names from detail if present
     if type(detail) == "table" then
-        local orig = detail.originalName or (detail.series and detail.series.originalName)
-        local loc  = detail.localizedName or (detail.series and detail.series.localizedName)
-        local nm   = detail.name or (detail.series and detail.series.name)
+        local orig = Utils.firstNonEmpty(detail.originalName, detail.series and detail.series.originalName)
+        local loc  = Utils.firstNonEmpty(detail.localizedName, detail.series and detail.series.localizedName)
+        local nm   = Utils.firstNonEmpty(detail.name, detail.series and detail.series.name)
         if orig and not self.current_series_names.originalName then self.current_series_names.originalName = orig end
         if loc and not self.current_series_names.localizedName then self.current_series_names.localizedName = loc end
         if nm and not self.current_series_names.name then self.current_series_names.name = nm end
@@ -1074,7 +1036,7 @@ function KavitaBrowser:editServerFromInput(fields, item)
     local new_server = {
         name        = fields[1],
         kavita_url  = fields[2]:match("^%a+://") and fields[2] or "http://" .. fields[2],
-        api_key     = fields[3] ~= "" and fields[3] or nil,
+        api_key     = Utils.firstNonEmpty(fields[3]),
     }
     local new_item = buildRootEntry(new_server)
     local new_idx, itemnumber
@@ -1168,25 +1130,10 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
         end
     end
 
-    local function normalize_authors(a)
-        if type(a) == "string" then return a end
-        if type(a) == "table" then
-            local names = {}
-            for _, v in ipairs(a) do
-                if type(v) == "string" then
-                    table.insert(names, v)
-                elseif type(v) == "table" and v.name then
-                    table.insert(names, v.name)
-                end
-            end
-            if #names > 0 then return table.concat(names, ", ") end
-        end
-    end
-
     local author =
-        (self.current_series_names and normalize_authors(self.current_series_names.author))
+        (self.current_series_names and Utils.joinPersonNames(self.current_series_names.author))
         or self.catalog_author
-        or normalize_authors(chapter.writers)
+        or Utils.joinPersonNames(chapter.writers)
 
     local series_names = self.current_series_names or {}
 
@@ -1212,7 +1159,7 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
 
     local metadata = {
         -- Primary labels
-        seriesName    = series_name or series_names.localizedName or series_names.name,
+        seriesName    = Utils.firstNonEmpty(series_name, series_names.localizedName, series_names.name),
         author        = author,
 
         -- Alternate/localized/original names if known
@@ -1274,7 +1221,7 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
     local viewer = KamareImageViewer:new{
         ui = self.ui,
         images_list_data = images_list_data,
-        title = metadata.seriesName or _("Manga"),
+        title = Utils.firstNonEmpty(metadata.seriesName, _("Manga")),
         fullscreen = true,
         with_title_bar = false,
         images_list_nb = pages,
@@ -1288,7 +1235,7 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
             if not sid then return end
             local lid = self.current_series_library_id
             local sname = self.catalog_title
-                or (self.current_series_names and (self.current_series_names.localizedName or self.current_series_names.name))
+                or (self.current_series_names and Utils.firstNonEmpty(self.current_series_names.localizedName, self.current_series_names.name))
                 or _("Series")
             UIManager:nextTick(function()
                 self:showSeriesDetail(sname, sid, lid, { refresh_only = true })
@@ -1355,7 +1302,7 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
                 end
 
                 local sname = self.catalog_title
-                    or (self.current_series_names and (self.current_series_names.localizedName or self.current_series_names.name))
+                    or (self.current_series_names and Utils.firstNonEmpty(self.current_series_names.localizedName, self.current_series_names.name))
                     or _("Series")
                 self:launchKavitaChapterViewer(next_chapter, sname)
             end)
@@ -1404,10 +1351,10 @@ function KavitaBrowser:onMenuSelect(item)
             local s = item.series or {}
             self.current_series_names = {
                 name = item.text,
-                originalName = s.originalName or s.seriesName or s.name,
+                originalName = Utils.firstNonEmpty(s.originalName, s.seriesName, s.name),
                 localizedName = s.localizedName,
                 -- Raw author data if present; will be normalized later
-                author = s.author or s.authors or s.writers,
+                author = Utils.firstNonEmpty(s.author, s.authors, s.writers),
             }
             self:showSeriesDetail(item.text, sid, lid)
             return true
@@ -1467,22 +1414,6 @@ function KavitaBrowser:showSeriesInfo(series_name, series_id)
         return "\u{FFF2}" .. text .. "\u{FFF3}"
     end
 
-    -- Helper function to format person arrays
-    local function formatPersons(persons)
-        if not persons or type(persons) ~= "table" or #persons == 0 then
-            return nil
-        end
-        local names = {}
-        for _, p in ipairs(persons) do
-            if type(p) == "table" and p.name then
-                table.insert(names, p.name)
-            elseif type(p) == "string" then
-                table.insert(names, p)
-            end
-        end
-        return #names > 0 and table.concat(names, ", ") or nil
-    end
-
     -- Helper function to format tag arrays
     local function formatTags(tags)
         if not tags or type(tags) ~= "table" or #tags == 0 then
@@ -1506,7 +1437,7 @@ function KavitaBrowser:showSeriesInfo(series_name, series_id)
     table.insert(info_parts, "\u{FFF1}")
 
     -- Summary/Description (most important, show first)
-    if metadata.summary and metadata.summary ~= "" then
+    if Utils.firstNonEmpty(metadata.summary) then
         table.insert(info_parts, metadata.summary)
         table.insert(info_parts, "")
     end
@@ -1563,48 +1494,48 @@ function KavitaBrowser:showSeriesInfo(series_name, series_id)
     -- Credits section
     local credits = {}
 
-    local writers = formatPersons(metadata.writers)
+    local writers = Utils.joinPersonNames(metadata.writers)
     if writers then
         table.insert(credits, bold(_("Writers:")) .. " " .. writers)
     end
 
-    local publishers = formatPersons(metadata.publishers)
+    local publishers = Utils.joinPersonNames(metadata.publishers)
     if publishers then
         table.insert(credits, bold(_("Publishers:")) .. " " .. publishers)
     end
 
-    local translators = formatPersons(metadata.translators)
+    local translators = Utils.joinPersonNames(metadata.translators)
     if translators then
         table.insert(credits, bold(_("Translators:")) .. " " .. translators)
     end
 
     -- Art credits
-    local cover_artists = formatPersons(metadata.coverArtists)
+    local cover_artists = Utils.joinPersonNames(metadata.coverArtists)
     if cover_artists then
         table.insert(credits, bold(_("Cover Art:")) .. " " .. cover_artists)
     end
 
-    local pencillers = formatPersons(metadata.pencillers)
+    local pencillers = Utils.joinPersonNames(metadata.pencillers)
     if pencillers then
         table.insert(credits, bold(_("Pencils:")) .. " " .. pencillers)
     end
 
-    local inkers = formatPersons(metadata.inkers)
+    local inkers = Utils.joinPersonNames(metadata.inkers)
     if inkers then
         table.insert(credits, bold(_("Inks:")) .. " " .. inkers)
     end
 
-    local colorists = formatPersons(metadata.colorists)
+    local colorists = Utils.joinPersonNames(metadata.colorists)
     if colorists then
         table.insert(credits, bold(_("Colors:")) .. " " .. colorists)
     end
 
-    local letterers = formatPersons(metadata.letterers)
+    local letterers = Utils.joinPersonNames(metadata.letterers)
     if letterers then
         table.insert(credits, bold(_("Letters:")) .. " " .. letterers)
     end
 
-    local editors = formatPersons(metadata.editors)
+    local editors = Utils.joinPersonNames(metadata.editors)
     if editors then
         table.insert(credits, bold(_("Editors:")) .. " " .. editors)
     end
@@ -1664,9 +1595,9 @@ function KavitaBrowser:onMenuHold(item)
                         self.current_series_library_id = lid
                         self.current_series_names = {
                             name = item.text,
-                            originalName = series.originalName or series.seriesName or series.name,
+                            originalName = Utils.firstNonEmpty(series.originalName, series.seriesName, series.name),
                             localizedName = series.localizedName,
-                            author = series.author or series.authors or series.writers,
+                            author = Utils.firstNonEmpty(series.author, series.authors, series.writers),
                         }
 
                         self:launchKavitaChapterViewer(chapter, item.text)
@@ -1678,9 +1609,9 @@ function KavitaBrowser:onMenuHold(item)
                         UIManager:close(dialog)
                         self.current_series_names = {
                             name = item.text,
-                            originalName = series.originalName or series.seriesName or series.name,
+                            originalName = Utils.firstNonEmpty(series.originalName, series.seriesName, series.name),
                             localizedName = series.localizedName,
-                            author = series.author or series.authors or series.writers,
+                            author = Utils.firstNonEmpty(series.author, series.authors, series.writers),
                         }
                         self:showSeriesDetail(item.text, sid, lid)
                     end,
@@ -1831,7 +1762,7 @@ function KavitaBrowser:onMenuHold(item)
                         if sid then
                             local lid = self.current_series_library_id
                             local sname = self.catalog_title
-                                or (self.current_series_names and (self.current_series_names.localizedName or self.current_series_names.name))
+                                or (self.current_series_names and Utils.firstNonEmpty(self.current_series_names.localizedName, self.current_series_names.name))
                                 or _("Series")
                             UIManager:nextTick(function()
                                 self:showSeriesDetail(sname, sid, lid, { refresh_only = true })
@@ -1984,7 +1915,7 @@ function KavitaBrowser:onMenuHold(item)
                         if sid then
                             local lid = self.current_series_library_id
                             local sname = self.catalog_title
-                                or (self.current_series_names and (self.current_series_names.localizedName or self.current_series_names.name))
+                                or (self.current_series_names and Utils.firstNonEmpty(self.current_series_names.localizedName, self.current_series_names.name))
                                 or _("Series")
                             UIManager:nextTick(function()
                                 self:showSeriesDetail(sname, sid, lid, { refresh_only = true })

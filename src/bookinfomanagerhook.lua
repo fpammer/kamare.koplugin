@@ -1,5 +1,6 @@
 local logger = require("logger")
 local KavitaClient = require("kavitaclient")
+local Utils = require("kamareutils")
 local RenderImage = require("ui/renderimage")
 local zstd = require("ffi/zstd")
 local SQ3 = require("lua-ljsqlite3/init")
@@ -114,12 +115,12 @@ local function fetchKavitaMetadata(filepath)
 
         return {
             pages = series_dto.pages or 0,
-            title = series_dto.localizedName or series_dto.name or "",
+            title = Utils.firstNonEmpty(series_dto.localizedName, series_dto.name) or "",
             authors = authors_str,
-            series = series_dto.name or series_dto.localizedName,
+            series = Utils.firstNonEmpty(series_dto.name, series_dto.localizedName),
             series_index = nil,  -- Series itself has no index
             language = series_metadata.language or "en",
-            keywords = keywords_str ~= "" and keywords_str or nil,
+            keywords = Utils.firstNonEmpty(keywords_str),
             description = type(series_metadata.summary) == "string" and series_metadata.summary or nil,
         }
 
@@ -130,28 +131,13 @@ local function fetchKavitaMetadata(filepath)
             return nil
         end
 
-        -- Apply the same naming logic as KavitaBrowser:buildKavitaVolumeItems
-        local vol_prefix = volume_metadata.number and ("Volume " .. tostring(volume_metadata.number)) or nil
-        local title
-        if volume_metadata.name and volume_metadata.name ~= "" then
-            local lower = volume_metadata.name:lower()
-            local is_just_number = tonumber(volume_metadata.name) ~= nil and volume_metadata.name:match("^%d+$")
-            if not (lower:find("vol") or lower:find("volume") or is_just_number) and vol_prefix then
-                title = vol_prefix .. ": " .. volume_metadata.name
-            elseif is_just_number and vol_prefix then
-                title = vol_prefix
-            else
-                title = volume_metadata.name
-            end
-        else
-            title = vol_prefix or ("Volume #" .. tostring(volume_metadata.id or "?"))
-        end
+        local title = Utils.buildVolumeTitle(volume_metadata)
 
         return {
             pages = volume_metadata.pages or 0,
             title = title,
             authors = "",
-            series = volume_metadata.seriesName or "",
+            series = Utils.firstNonEmpty(volume_metadata.seriesName) or "",
             series_index = volume_metadata.number,
             language = "en",
             keywords = nil,
@@ -165,33 +151,13 @@ local function fetchKavitaMetadata(filepath)
             return nil
         end
 
-        -- Apply the same naming logic as KavitaBrowser:buildKavitaChapterItems
-        local ch_prefix = chapter_metadata.number and ("Ch. " .. tostring(chapter_metadata.number)) or nil
-        local title
-
-        if chapter_metadata.isSpecial then
-            title = (chapter_metadata.titleName and chapter_metadata.titleName ~= "") and chapter_metadata.titleName
-                   or chapter_metadata.title
-                   or chapter_metadata.range
-                   or ("Special #" .. tostring(chapter_metadata.id or "?"))
-        elseif chapter_metadata.titleName and chapter_metadata.titleName ~= "" then
-            local lower = chapter_metadata.titleName:lower()
-            -- Skip prefix if title is just a number (avoids "Ch. 1: 1")
-            local is_just_number = tonumber(chapter_metadata.titleName) ~= nil and chapter_metadata.titleName:match("^%d+$")
-            if not (lower:find("ch") or lower:find("chap") or lower:find("chapter") or lower:find("vol") or lower:find("volume") or is_just_number) and ch_prefix then
-                title = ch_prefix .. ": " .. chapter_metadata.titleName
-            else
-                title = chapter_metadata.titleName
-            end
-        else
-            title = chapter_metadata.title or chapter_metadata.range or ch_prefix or ("Chapter #" .. tostring(chapter_metadata.id or "?"))
-        end
+        local title = Utils.buildChapterTitle(chapter_metadata)
 
         return {
             pages = chapter_metadata.pages or 0,
             title = title,
             authors = "",
-            series = chapter_metadata.seriesName or "",
+            series = Utils.firstNonEmpty(chapter_metadata.seriesName) or "",
             series_index = chapter_metadata.number,
             language = "en",
             keywords = nil,
