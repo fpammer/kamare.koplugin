@@ -1,5 +1,9 @@
 local Utils = {}
 
+local function hasWord(str, word)
+    return str:find("%f[%a]" .. word .. "%f[%A]") ~= nil
+end
+
 function Utils.firstNonEmpty(...)
     for i = 1, select('#', ...) do
         local v = select(i, ...)
@@ -36,7 +40,7 @@ function Utils.buildVolumeTitle(dto)
     if Utils.firstNonEmpty(dto.name) then
         local lower = dto.name:lower()
         local is_just_number = tonumber(dto.name) ~= nil and dto.name:match("^%d+$")
-        if not (lower:find("vol") or lower:find("volume") or is_just_number) and vol_prefix then
+        if not (hasWord(lower, "vol") or hasWord(lower, "volume") or is_just_number) and vol_prefix then
             return vol_prefix .. ": " .. dto.name
         elseif is_just_number and vol_prefix then
             return vol_prefix
@@ -54,8 +58,8 @@ function Utils.buildChapterTitle(dto)
     if Utils.firstNonEmpty(dto.titleName) then
         local lower = dto.titleName:lower()
         local is_just_number = tonumber(dto.titleName) ~= nil and dto.titleName:match("^%d+$")
-        if not (lower:find("ch") or lower:find("chap") or lower:find("chapter")
-                or lower:find("vol") or lower:find("volume") or is_just_number) and ch_prefix then
+        if not (hasWord(lower, "ch") or hasWord(lower, "chap") or hasWord(lower, "chapter")
+                or hasWord(lower, "vol") or hasWord(lower, "volume") or is_just_number) and ch_prefix then
             return ch_prefix .. ": " .. dto.titleName
         end
         return dto.titleName
