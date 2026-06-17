@@ -402,6 +402,9 @@ function VirtualPageCanvas:paintTo(target, x, y)
     local canvas_h = self.dimen.h
     if canvas_w <= 0 or canvas_h <= 0 then return end
 
+    self.dimen.x = x
+    self.dimen.y = y
+
     target:paintRect(x, y, canvas_w, canvas_h, self.background)
 
     if not (self.document and self.document.is_open) then
