@@ -1134,6 +1134,8 @@ function KamareImageViewer:_setScrollOffset(offset, opts)
         self.scroll_offset = clamped
         if self.canvas then
             self.canvas:setScrollOffset(clamped)
+
+            UIManager:setDirty(self, "partial", self.canvas.dimen)
         end
         self:_updatePageFromScroll(opts and opts.silent)
     end
@@ -1383,6 +1385,8 @@ end
 function KamareImageViewer:updateImageOnly()
     if not self.canvas then return self:update() end
     self:_updateCanvasState()
+
+    UIManager:setDirty(self, "partial", self.canvas.dimen)
 end
 
 function KamareImageViewer:estimatePageTileCount(pageno)
