@@ -58,6 +58,7 @@ local KamareImageViewer = InputContainer:extend{
     current_zoom = 1.0,
     zoom_mode = 0, -- "full"
     _pending_scroll_page = nil,
+    _pending_scroll_anchor = nil, -- { page = N, frac = 0..1 } for rotation continuity
 
     scroll_distance = 25, -- percentage (25, 50, 75, 100)
     scroll_margin = 0, -- horizontal margin in scroll mode (left/right only)
@@ -1300,7 +1301,25 @@ function KamareImageViewer:_updateCanvasState()
 
     if self.view_mode == 1 then
         local desired = self.scroll_offset or 0
-        if self._pending_scroll_page then
+        if self._pending_scroll_anchor then
+            -- Resolve the page-anchored fractional position in the new layout.
+            local anchor = self._pending_scroll_anchor
+            local viewport_w = select(1, self.canvas:getViewportSize())
+            local total_pages = self._images_list_nb or 0
+            local page_start = self.virtual_document:getScrollPositionForPage(
+                anchor.page, self.current_zoom, rotation, self.zoom_mode, viewport_w)
+            local next_start
+            if anchor.page >= total_pages then
+                next_start = self.virtual_document:getVirtualHeight(
+                    self.current_zoom, rotation, self.zoom_mode, viewport_w)
+            else
+                next_start = self.virtual_document:getScrollPositionForPage(
+                    anchor.page + 1, self.current_zoom, rotation, self.zoom_mode, viewport_w)
+            end
+            desired = math.floor(page_start + anchor.frac * (next_start - page_start) + 0.5)
+            self._pending_scroll_anchor = nil
+            self._pending_scroll_page = nil
+        elseif self._pending_scroll_page then
             local viewport_w = select(1, self.canvas:getViewportSize())
             desired = self.virtual_document:getScrollPositionForPage(self._pending_scroll_page, self.current_zoom, rotation, self.zoom_mode, viewport_w)
             self._pending_scroll_page = nil
@@ -2193,6 +2212,39 @@ function KamareImageViewer:handleRotation(mode, old_mode)
     if matching_orientation then
         UIManager:setDirty(self, "full")
     else
+        -- Capture a page-anchored position (page index + within-page fraction)
+        -- so continuous mode lands at the same spot after the orientation flip.
+        local captured_anchor = nil
+        if self.view_mode == 1 and self.canvas and self.virtual_document then
+            local max_scroll = self.canvas:getMaxScrollOffset() or 0
+            local so = self.scroll_offset or 0
+            if max_scroll > 0 and so > 0 then
+                local rotation = self:_getRotationAngle()
+                local viewport_w = select(1, self.canvas:getViewportSize())
+                local zoom = self.canvas.zoom or self.current_zoom or 1.0
+                local total_pages = self._images_list_nb or 0
+                local page_at_top = self.virtual_document:getPageAtOffset(
+                    so, zoom, rotation, self.zoom_mode, viewport_w)
+                local page_start = self.virtual_document:getScrollPositionForPage(
+                    page_at_top, zoom, rotation, self.zoom_mode, viewport_w)
+                local next_start
+                if page_at_top >= total_pages then
+                    next_start = self.virtual_document:getVirtualHeight(
+                        zoom, rotation, self.zoom_mode, viewport_w)
+                else
+                    next_start = self.virtual_document:getScrollPositionForPage(
+                        page_at_top + 1, zoom, rotation, self.zoom_mode, viewport_w)
+                end
+                local page_h = next_start - page_start
+                local frac = 0
+                if page_h > 0 then
+                    frac = (so - page_start) / page_h
+                    if frac < 0 then frac = 0 elseif frac > 1 then frac = 1 end
+                end
+                captured_anchor = { page = page_at_top, frac = frac }
+            end
+        end
+
         UIManager:setDirty(nil, "full")
         local new_screen_size = Screen:getSize()
 
@@ -2222,7 +2274,13 @@ function KamareImageViewer:handleRotation(mode, old_mode)
             self.canvas_container.dimen = Geom:new{ w = self.width, h = self.height }
         end
 
-        self._pending_scroll_page = self._images_list_cur
+        if captured_anchor then
+            self._pending_scroll_anchor = captured_anchor
+            self._pending_scroll_page = nil
+        else
+            self._pending_scroll_anchor = nil
+            self._pending_scroll_page = self._images_list_cur
+        end
 
         if self.canvas then
             self.canvas._layout_dirty = true
