@@ -63,19 +63,6 @@ local function fetchKavitaMetadata(filepath)
             logger.warn("Kamare: Failed to fetch series metadata for:", item_id, "code:", code)
             return nil
         end
-    -- For volumes and chapters, use item_table since the API endpoints expect series IDs
-    -- and we have volume/chapter IDs. The item_table has all the info we need including number.
-    if item_type == "volume" or item_type == "chapter" then
-        logger.dbg("Kamare: Fetching volume/chapter metadata from item_table")
-        return fetchKavitaMetadataFromItemTable(filepath, BookInfoManager)
-    end
-
-    -- For series, fetch metadata from Kavita API
-    local series_metadata, code = KavitaClient:getSeriesMetadata(item_id)
-    if not series_metadata or code ~= 200 then
-        logger.warn("Kamare: Failed to fetch series metadata for:", item_id, "code:", code)
-        return fetchKavitaMetadataFromItemTable(filepath, BookInfoManager)
-    end
 
         -- Also fetch SeriesDto for pages count and name
         local series_dto, code2 = KavitaClient:getSeriesById(item_id)
@@ -168,6 +155,21 @@ local function fetchKavitaMetadata(filepath)
     return nil
 end
 
+-- Helper: Calculate cached cover size while maintaining aspect ratio
+-- (mirrors BookInfoManager.getCachedCoverSize; kept local to avoid a _G global)
+local function getCachedCoverSize(img_w, img_h, max_img_w, max_img_h)
+    local scale_factor
+    local width = math.floor(max_img_h * img_w / img_h + 0.5)
+    if max_img_w >= width then
+        max_img_w = width
+        scale_factor = max_img_w / img_w
+    else
+        max_img_h = math.floor(max_img_w * img_h / img_w + 0.5)
+        scale_factor = max_img_h / img_h
+    end
+    return max_img_w, max_img_h, scale_factor
+end
+
 -- Helper: Fetch and process cover image from Kavita API
 local function fetchKavitaCover(item_type, item_id, cover_specs)
     -- Get cover specs (default to 600x600 like BookInfoManager)
@@ -235,20 +237,6 @@ local function fetchKavitaCover(item_type, item_id, cover_specs)
         bb_stride = stride,
         bb_data = compressed_data,
     }
-end
-
--- Helper: Calculate cached cover size while maintaining aspect ratio (copied from BookInfoManager)
-function getCachedCoverSize(img_w, img_h, max_img_w, max_img_h)
-    local scale_factor
-    local width = math.floor(max_img_h * img_w / img_h + 0.5)
-    if max_img_w >= width then
-        max_img_w = width
-        scale_factor = max_img_w / img_w
-    else
-        max_img_h = math.floor(max_img_w * img_h / img_w + 0.5)
-        scale_factor = max_img_h / img_h
-    end
-    return max_img_w, max_img_h, scale_factor
 end
 
 -- Overridden getBookInfo function
