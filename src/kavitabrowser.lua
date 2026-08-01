@@ -349,12 +349,24 @@ function KavitaBrowser:buildKavitaDashboardItems(dashboard)
     end
     table.insert(items, item)
 
+    -- Manually add "Reading Lists" entry (opens the user's reading lists view)
+    local rl_item = {
+        text = _("Reading Lists"),
+        kavita_reading_lists_root = true,
+    }
+    if self.has_coverbrowser then
+        rl_item.is_file = false
+        rl_item.path = string.format("/kavita/%s/reading-lists/",
+            self.current_server_name or "unknown")
+    end
+    table.insert(items, rl_item)
+
     return items
 end
 
 -- Fetch dashboard and display it as the server root list
 function KavitaBrowser:showDashboardAfterSelection(server_name)
-    local loading = InfoMessage:new{ text = _("Loading..."), timeout = 0 }
+    local loading = InfoMessage:new{ text = T(_("Connecting to %1…"), server_name or _("server")), timeout = 0 }
     UIManager:show(loading)
     UIManager:forceRePaint()
 
@@ -416,7 +428,7 @@ function KavitaBrowser:showKavitaSearchDialog()
 end
 
 function KavitaBrowser:performKavitaSearch(query)
-    local loading = InfoMessage:new{ text = _("Searching…"), timeout = 0 }
+    local loading = InfoMessage:new{ text = T(_("Searching for %1…"), query), timeout = 0 }
     UIManager:show(loading)
     UIManager:forceRePaint()
 
@@ -491,7 +503,7 @@ function KavitaBrowser:buildKavitaVolumeItems(volumes)
             local name = Utils.buildVolumeTitle(v)
             local read = v.pagesRead
             local total = v.pages
-            local subtitle = (total and read) and (tostring(read) .. "/" .. tostring(total) .. " pages") or nil
+            local subtitle = (total and read) and (tostring(read) .. "/" .. tostring(total) .. " " .. _("pages")) or nil
             local mandatory = progress_icon(read, total)
             local item = {
                 text = name,
@@ -527,7 +539,7 @@ function KavitaBrowser:buildKavitaChapterItems(chapters, kind)
             local total = c.pages
             local subtitle
             if total and read then
-                subtitle = tostring(read) .. "/" .. tostring(total) .. " pages"
+                subtitle = tostring(read) .. "/" .. tostring(total) .. " " .. _("pages")
             end
 
             local mandatory = progress_icon(read, total)
@@ -557,7 +569,7 @@ end
 
 -- Fetch SeriesDetail and display Volumes, then Chapters, then Specials
 function KavitaBrowser:showSeriesDetail(series_name, series_id, library_id, opts)
-    local loading = InfoMessage:new{ text = _("Loading..."), timeout = 0 }
+    local loading = InfoMessage:new{ text = T(_("Loading series %1…"), series_name or _("unknown")), timeout = 0 }
     UIManager:show(loading)
     UIManager:forceRePaint()
 
@@ -638,7 +650,7 @@ end
 -- stream_title: optional display title for the stream
 -- smart_filter_encoded: optional smartFilterEncoded for smart filters
 function KavitaBrowser:showKavitaStream(stream_name, stream_type, stream_title, smart_filter_encoded)
-    local loading = InfoMessage:new{ text = _("Loading..."), timeout = 0 }
+    local loading = InfoMessage:new{ text = T(_("Loading %1…"), stream_title or _("stream")), timeout = 0 }
     UIManager:show(loading)
     UIManager:forceRePaint()
 
@@ -771,6 +783,235 @@ function KavitaBrowser:showKavitaStream(stream_name, stream_type, stream_title, 
     end
 
     self:switchItemTable(self.catalog_title, items, nil, nil, nil)
+    self:setTitleBarLeftIcon("appbar.menu")
+    self.onLeftButtonTap = function()
+        self:showTitleMenu()
+    end
+end
+
+-- Build menu entries from a list of ReadingListDto
+function KavitaBrowser:buildKavitaReadingListItems(lists)
+    local items = {}
+    if type(lists) == "table" then
+        for __, rl in ipairs(lists) do
+            local title = Utils.firstNonEmpty(rl.title, _("Unnamed list"))
+            if rl.promoted then
+                title = "★ " .. title
+            end
+
+            local subtitle_parts = {}
+            if rl.itemCount and rl.itemCount > 0 then
+                table.insert(subtitle_parts, tostring(rl.itemCount) .. " " .. _("items"))
+            end
+            if Utils.firstNonEmpty(rl.ownerUserName) then
+                table.insert(subtitle_parts, rl.ownerUserName)
+            end
+            local subtitle = #subtitle_parts > 0 and table.concat(subtitle_parts, " • ") or nil
+
+            local item = {
+                text = title,
+                author = subtitle,
+                mandatory = self.has_coverbrowser and nil or (rl.itemCount and tostring(rl.itemCount) or ""),
+                kavita_reading_list = true,
+                reading_list = rl,
+            }
+
+            -- Virtual filepath (always set to prevent CoverBrowser crashes)
+            if rl.id then
+                item.file = string.format("/kavita/%s/reading-list/%d.kavita",
+                                          self.current_server_name or "unknown",
+                                          rl.id)
+                item.is_file = true
+            end
+
+            table.insert(items, item)
+        end
+    end
+    return items
+end
+
+-- Fetch and display all of the user's reading lists.
+-- Mirrors the pagination loop in showKavitaStream.
+function KavitaBrowser:showReadingLists()
+    local loading = InfoMessage:new{ text = _("Loading reading lists…"), timeout = 0 }
+    UIManager:show(loading)
+    UIManager:forceRePaint()
+
+    local all_data = {}
+    local page_num = 1
+    local page_size = 50
+    local has_more = true
+
+    while has_more do
+        local data, code, __, status = KavitaClient:getReadingLists({
+            PageNumber = page_num,
+            PageSize   = page_size,
+        })
+
+        if not data then
+            UIManager:close(loading)
+            self:handleCatalogError("reading-lists", "/api/ReadingList/lists", status or code)
+            return
+        end
+
+        if type(data) == "table" and #data > 0 then
+            for _, it in ipairs(data) do
+                table.insert(all_data, it)
+            end
+            if #data < page_size then
+                has_more = false
+            else
+                page_num = page_num + 1
+            end
+        else
+            has_more = false
+        end
+    end
+
+    UIManager:close(loading)
+
+    local items = self:buildKavitaReadingListItems(all_data)
+
+    self.catalog_title = _("Reading Lists")
+    self.search_url = nil
+
+    -- Push path so Back returns to dashboard (skip when already on this view)
+    self.paths = self.paths or {}
+    local top = self.paths[#self.paths]
+    if not (top and top.kavita_reading_lists_root) then
+        table.insert(self.paths, {
+            kavita_reading_lists_root = true,
+            title = self.catalog_title,
+        })
+    end
+
+    self:switchItemTable(self.catalog_title, items, nil, nil, nil)
+    self:setTitleBarLeftIcon("appbar.menu")
+    self.onLeftButtonTap = function()
+        self:showTitleMenu()
+    end
+end
+
+-- Build menu entries from a list of ReadingListItemDto as openable chapters.
+-- Each item is synthesized into a ChapterDto-compatible table so the existing
+-- launchKavitaChapterViewer and CoverBrowser progress logic work unchanged.
+function KavitaBrowser:buildKavitaReadingListItemItems(rli_items)
+    local items = {}
+    if type(rli_items) == "table" then
+        for __, rli in ipairs(rli_items) do
+            local ch = rli.chapter or {}
+            local series_name = Utils.firstNonEmpty(rli.seriesName, _("Unknown series"))
+
+            local dto_for_title = {
+                id        = ch.id or rli.chapterId,
+                number    = ch.minNumber,
+                isSpecial = ch.isSpecial,
+                titleName = ch.titleName,
+                title     = rli.title,
+                range     = ch.range,
+            }
+            local chapter_label = Utils.buildChapterTitle(dto_for_title)
+
+            local pages = ch.pages or 0
+            local read  = rli.pagesRead or 0
+            local subtitle
+            if pages and pages > 0 then
+                subtitle = tostring(read) .. "/" .. tostring(pages) .. " " .. _("pages")
+            end
+            local mandatory = progress_icon(read, pages)
+
+            -- Carry the writer name through as a writers[] table for the viewer
+            local writers
+            if Utils.firstNonEmpty(ch.writerName) then
+                writers = {{ name = ch.writerName, id = ch.writerId }}
+            end
+
+            -- ChapterDto-shaped
+            local synthetic_chapter = {
+                id         = ch.id or rli.chapterId,
+                pages      = ch.pages,
+                pagesRead  = rli.pagesRead,
+                volumeId   = rli.volumeId,
+                range      = ch.range,
+                isSpecial  = ch.isSpecial,
+                titleName  = ch.titleName,
+                number     = ch.minNumber,
+                minNumber  = ch.minNumber,
+                maxNumber  = ch.maxNumber,
+                writers    = writers,
+                sortOrder  = ch.sortOrder,
+                -- for postReaderProgress (progress is per-series/library)
+                seriesId   = rli.seriesId,
+                libraryId  = rli.libraryId,
+            }
+
+            local item = {
+                text = series_name .. " — " .. chapter_label,
+                author = subtitle,
+                mandatory = self.has_coverbrowser and nil or mandatory,
+                kavita_chapter = true,
+                chapter = synthetic_chapter,
+                is_special = ch.isSpecial or nil,
+                reading_list_item = rli,
+            }
+
+            if synthetic_chapter.id then
+                item.file = string.format("/kavita/%s/chapter/%d.kavita",
+                                          self.current_server_name or "unknown",
+                                          synthetic_chapter.id)
+                item.is_file = true
+            end
+
+            table.insert(items, item)
+        end
+    end
+    return items
+end
+
+-- Fetch and display the items of a single reading list.
+-- opts.refresh_only: when true, do not push a new path entry (used by close/refresh callbacks)
+function KavitaBrowser:showReadingListDetail(reading_list_id, reading_list_title, opts)
+    local loading = InfoMessage:new{ text = T(_("Loading %1…"), reading_list_title or _("reading list")), timeout = 0 }
+    UIManager:show(loading)
+    UIManager:forceRePaint()
+
+    local items_data, code, __, status = KavitaClient:getReadingListItems(reading_list_id)
+
+    UIManager:close(loading)
+
+    if not items_data then
+        self:handleCatalogError("reading-list", "/api/ReadingList/items", status or code)
+        return
+    end
+
+    -- Ensure ordering by the list's `order` field (API normally returns sorted, but be safe)
+    if type(items_data) == "table" then
+        table.sort(items_data, function(a, b)
+            return (a.order or 0) < (b.order or 0)
+        end)
+    end
+
+    local items = self:buildKavitaReadingListItemItems(items_data or {})
+
+    self.catalog_title = reading_list_title or _("Reading List")
+    self.search_url = nil
+
+    local refresh_only = opts and opts.refresh_only
+    if not refresh_only then
+        self.paths = self.paths or {}
+        local top = self.paths[#self.paths]
+        if not (top and top.kavita_reading_list_root == reading_list_id) then
+            table.insert(self.paths, {
+                kavita_reading_list_root = reading_list_id,
+                reading_list_title = reading_list_title,
+                title = self.catalog_title,
+            })
+        end
+    end
+
+    -- -1 maintains current page when refreshing, nil resets to page 1
+    local itemnumber = refresh_only and -1 or nil
+    self:switchItemTable(self.catalog_title, items, itemnumber, nil, nil)
     self:setTitleBarLeftIcon("appbar.menu")
     self.onLeftButtonTap = function()
         self:showTitleMenu()
@@ -953,8 +1194,6 @@ function KavitaBrowser:authenticateAfterSelection(server_name, server_url)
     else
         logger.warn("Kavita server version check failed:", status or "unknown error", "code:", code)
     end
-
-    self:persistBearerToken(server_name, server_url, token)
 end
 
 
@@ -1088,6 +1327,10 @@ function KavitaBrowser:handleCatalogError(context, item_url, error_msg)
         message = _("Cannot load series details. Please check your connection.")
     elseif context == "stream" then
         message = _("Cannot load content. Please check your connection.")
+    elseif context == "reading-lists" then
+        message = _("Cannot load reading lists. Please check your connection.")
+    elseif context == "reading-list" then
+        message = _("Cannot load reading list. Please check your connection.")
     else
         message = _("Cannot load data from server. Please check your connection.")
     end
@@ -1097,9 +1340,43 @@ function KavitaBrowser:handleCatalogError(context, item_url, error_msg)
     })
 end
 
+-- Refresh whatever view is currently on top of the path stack.
+-- Used by viewer on_close and "mark as read" flows so the right screen is
+-- refreshed (reading list vs. series detail) instead of always jumping to
+-- series detail.
+function KavitaBrowser:refreshCurrentView()
+    local top = self.paths and self.paths[#self.paths]
+    if top and top.kavita_reading_list_root then
+        UIManager:nextTick(function()
+            self:showReadingListDetail(
+                top.kavita_reading_list_root,
+                top.reading_list_title or top.title,
+                { refresh_only = true }
+            )
+        end)
+        return
+    end
+    -- Default: refresh the current series detail (if any)
+    local sid = self.current_series_id
+    if not sid then return end
+    local lid = self.current_series_library_id
+    local sname = self.catalog_title
+        or (self.current_series_names and Utils.firstNonEmpty(self.current_series_names.localizedName, self.current_series_names.name))
+        or _("Series")
+    UIManager:nextTick(function()
+        self:showSeriesDetail(sname, sid, lid, { refresh_only = true })
+    end)
+end
+
 -- Launch the Kavita chapter viewer using Reader/image endpoint
 function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume, override_view_mode)
     if not chapter or not chapter.id then return end
+
+    -- Singleton guard: refuse to launch if a viewer is already open
+    if KamareImageViewer.active_instance then
+        logger.dbg("KavitaBrowser: KamareImageViewer already active, ignoring launch request")
+        return
+    end
 
     local pages = chapter.pages or (chapter.files and #chapter.files) or 0
     if pages <= 0 then
@@ -1109,7 +1386,7 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
     end
 
     -- Show loading indicator
-    local loading = InfoMessage:new{ text = _("Loading..."), timeout = 0 }
+    local loading = InfoMessage:new{ text = is_volume and _("Opening volume…") or _("Opening chapter…"), timeout = 0 }
     UIManager:show(loading)
     UIManager:forceRePaint()
 
@@ -1231,20 +1508,12 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
         kamare_settings = self.kamare_settings,
         override_view_mode = override_view_mode,
         on_close_callback = function(current_page, total_pages)
-            local sid = self.current_series_id
-            if not sid then return end
-            local lid = self.current_series_library_id
-            local sname = self.catalog_title
-                or (self.current_series_names and Utils.firstNonEmpty(self.current_series_names.localizedName, self.current_series_names.name))
-                or _("Series")
-            UIManager:nextTick(function()
-                self:showSeriesDetail(sname, sid, lid, { refresh_only = true })
-            end)
+            self:refreshCurrentView()
         end,
         on_next_chapter_callback = function(next_chapter_id)
             -- Fetch the next chapter details and launch viewer
             UIManager:nextTick(function()
-                local next_loading = InfoMessage:new{ text = _("Loading next chapter..."), timeout = 0 }
+                local next_loading = InfoMessage:new{ text = _("Loading next chapter…"), timeout = 0 }
                 UIManager:show(next_loading)
                 UIManager:forceRePaint()
 
@@ -1323,6 +1592,22 @@ end
 function KavitaBrowser:onMenuSelect(item)
     -- Only Kavita items are supported
     if item.kavita_chapter and item.chapter and item.chapter.id then
+        -- Reading-list chapter items: stash series context so the viewer can
+        -- post progress against the correct series/library.
+        if item.reading_list_item then
+            local rli = item.reading_list_item
+            self.current_series_id = rli.seriesId
+            self.current_series_library_id = rli.libraryId
+            self.current_series_names = {
+                name = rli.seriesName,
+                author = Utils.firstNonEmpty(
+                    Utils.joinPersonNames(item.chapter.writers),
+                    rli.chapter and rli.chapter.writerName
+                ),
+            }
+            self:launchKavitaChapterViewer(item.chapter, rli.seriesName or self.catalog_title, false)
+            return true
+        end
         self:launchKavitaChapterViewer(item.chapter, self.catalog_title or self.current_server_name, false)
         return true
     end
@@ -1361,6 +1646,21 @@ function KavitaBrowser:onMenuSelect(item)
         end
     end
 
+    if item.kavita_reading_lists_root then
+        self:showReadingLists()
+        return true
+    end
+
+    if item.kavita_reading_list then
+        local rl = item.reading_list
+        if not rl or not rl.id then
+            UIManager:show(InfoMessage:new{ text = _("Invalid reading list") })
+            return true
+        end
+        self:showReadingListDetail(rl.id, item.text)
+        return true
+    end
+
     if item.kavita_dashboard then
         local stream_name = item.kavita_stream_name or (item.dashboard and item.dashboard.name)
         if not stream_name or stream_name == "" then
@@ -1395,7 +1695,7 @@ function KavitaBrowser:showSeriesInfo(series_name, series_id)
         return
     end
 
-    local loading = InfoMessage:new{ text = _("Loading series info..."), timeout = 0 }
+    local loading = InfoMessage:new{ text = T(_("Loading info for %1…"), series_name or _("series")), timeout = 0 }
     UIManager:show(loading)
     UIManager:forceRePaint()
 
@@ -1578,7 +1878,7 @@ function KavitaBrowser:onMenuHold(item)
                     callback = function()
                         UIManager:close(dialog)
 
-                        local loading = InfoMessage:new{ text = _("Loading..."), timeout = 0 }
+                        local loading = InfoMessage:new{ text = T(_("Resuming %1…"), item.text or _("series")), timeout = 0 }
                         UIManager:show(loading)
                         UIManager:forceRePaint()
 
@@ -1757,17 +2057,8 @@ function KavitaBrowser:onMenuHold(item)
                     local code = KavitaClient:postReaderProgress(progress)
                     if code == 200 or code == 204 then
                         UIManager:show(InfoMessage:new{ text = _("Marked as read") })
-                        -- Refresh the series view to update progress indicators
-                        local sid = self.current_series_id
-                        if sid then
-                            local lid = self.current_series_library_id
-                            local sname = self.catalog_title
-                                or (self.current_series_names and Utils.firstNonEmpty(self.current_series_names.localizedName, self.current_series_names.name))
-                                or _("Series")
-                            UIManager:nextTick(function()
-                                self:showSeriesDetail(sname, sid, lid, { refresh_only = true })
-                            end)
-                        end
+                        -- Refresh the current view to update progress indicators
+                        self:refreshCurrentView()
                     else
                         UIManager:show(InfoMessage:new{ text = _("Failed to mark as read") })
                     end
@@ -1910,17 +2201,8 @@ function KavitaBrowser:onMenuHold(item)
                     local code = KavitaClient:postReaderProgress(progress)
                     if code == 200 or code == 204 then
                         UIManager:show(InfoMessage:new{ text = _("Marked as read") })
-                        -- Refresh the series view to update progress indicators
-                        local sid = self.current_series_id
-                        if sid then
-                            local lid = self.current_series_library_id
-                            local sname = self.catalog_title
-                                or (self.current_series_names and Utils.firstNonEmpty(self.current_series_names.localizedName, self.current_series_names.name))
-                                or _("Series")
-                            UIManager:nextTick(function()
-                                self:showSeriesDetail(sname, sid, lid, { refresh_only = true })
-                            end)
-                        end
+                        -- Refresh the current view to update progress indicators
+                        self:refreshCurrentView()
                     else
                         UIManager:show(InfoMessage:new{ text = _("Failed to mark as read") })
                     end
@@ -1993,6 +2275,15 @@ function KavitaBrowser:onReturn()
                 path.stream_title,
                 path.smart_filter_encoded
             )
+        elseif path.kavita_reading_list_root then
+            -- return into the open reading list
+            self:showReadingListDetail(
+                path.kavita_reading_list_root,
+                path.reading_list_title or path.title
+            )
+        elseif path.kavita_reading_lists_root then
+            -- return to the reading lists overview
+            self:showReadingLists()
         elseif path.kavita_dashboard_root then
             -- return to dashboard for current server
             self:showDashboardAfterSelection(self.current_server_name or self.catalog_title)

@@ -10,6 +10,7 @@ local UIManager = require("ui/uimanager")
 local FrontlightWidget = require("ui/widget/frontlightwidget")
 local Screen = Device.screen
 local logger = require("logger")
+local time = require("ui/time")
 local DocCache = require("document/doccache")
 local ConfigDialog = require("ui/widget/configdialog")
 local CanvasContext = require("document/canvascontext")
@@ -24,11 +25,51 @@ local KavitaClient = require("kavitaclient")
 local Math = require("optmath")
 local ButtonDialog = require("ui/widget/buttondialog")
 local VIDCache = require("virtualimagedocumentcache")
+local AsyncFetch = require("kamareasyncfetch")
 local InfoMessage = require("ui/widget/infomessage")
 local FFIUtil = require("ffi/util")
 local _ = require("gettext")
 local Utils = require("kamareutils")
 local T = FFIUtil.template
+
+-- Prefetch budget fraction of VIDCache. Active viewport tiles + cached-ahead
+-- pages + newly prefetched pages are kept under cache_size * BUDGET_FRACTION
+-- (with a small safety margin) so on-screen tiles aren't evicted by the LRU
+-- while the user is still looking at them. See calculateAdaptivePrefetch.
+local BUDGET_FRACTION = 0.75
+local BUDGET_SAFETY_MARGIN_BYTES = 2 * 1024 * 1024  -- 2 MB slack for backscroll / rounding
+
+-- Adaptive-network tuning. The estimator keeps a ring of recent fetch
+-- outcomes; prefetch depth shrinks and speculative prefetch pauses as the
+-- link degrades, and transient failures are retried instead of permanently
+-- blacklisting a page. See _recordNetSample / _netErrRate / _netBw.
+local NET_SAMPLE_WINDOW     = 8      -- recent fetch outcomes retained
+local NET_PAUSE_ERR_RATE    = 0.50   -- >= this recent failure rate -> pause prefetch
+local NET_PAUSE_MIN_SAMPLES = 3      -- don't pause before we have this many samples
+local NET_BW_FACTOR_FLOOR   = 0.15   -- never starve the immediate-next-page prefetch
+-- Adaptive-prefetch tier maps. _netTier() classifies the link 3 (fast/clean)
+-- .. 0 (poor); these map each tier to a depth multiplier and a lookahead cap.
+local NET_BW_FACTOR_BY_TIER = { [3] = 1.0, [2] = 0.6, [1] = 0.3, [0] = NET_BW_FACTOR_FLOOR }
+local NET_LOOKAHEAD_BY_TIER = { [3] = 64,  [2] = 6,   [1] = 3,   [0] = 2 }
+-- Transient-failure retry: up to N attempts with this exponential backoff (s).
+local NET_RETRY_MAX       = 3
+local NET_RETRY_BACKOFF_S = { 1, 2, 4 }
+
+-- Position-aware eviction: pages retained behind the reader for cheap
+-- scroll-back. Eviction prefers far-behind pages (then far-ahead) over the
+-- near read-ahead window; this keep-zone protects the immediate back-pages.
+local EVICT_BEHIND_KEEP   = 2
+
+-- Classify a fetch failure. 4xx responses mean the page genuinely won't be
+-- served (auth/missing/etc) -> permanent, don't retry. Everything else
+-- (timeouts, truncation, connect/handshake/send errors, 5xx, empty body) is
+-- transient on a flaky link and worth retrying with backoff.
+local function isPermanentFetchFailure(code)
+    if code and code >= 400 and code < 500 then
+        return true
+    end
+    return false
+end
 
 local KamareImageViewer = InputContainer:extend{
     images_list_data = nil,
@@ -37,7 +78,6 @@ local KamareImageViewer = InputContainer:extend{
     fullscreen = true,
     width = nil,
     height = nil,
-    rotated = false,
     title = "",
     canvas = nil,
     canvas_container = nil,
@@ -49,7 +89,7 @@ local KamareImageViewer = InputContainer:extend{
     configurable = Configurable:new(),
     options = KamareOptions,
     prefetch_pages = 1,
-    page_gap_height = 5,
+    page_gap_height = 8,
 
     virtual_document = nil,
     view_mode = 0, -- 0: page, 1: continuous, 2: dual
@@ -61,11 +101,44 @@ local KamareImageViewer = InputContainer:extend{
     _pending_scroll_anchor = nil, -- { page = N, frac = 0..1 } for rotation continuity
 
     scroll_distance = 25, -- percentage (25, 50, 75, 100)
-    scroll_margin = 0, -- horizontal margin in scroll mode (left/right only)
-    page_padding = 0, -- uniform padding on all sides
+    h_margin = 0, -- left/right viewport margin
+    top_margin = 0, -- top viewport margin
+    bottom_margin = 0, -- bottom viewport margin
+    dual_page_gap = 5, -- gap between side-by-side pages in dual page mode
     background_color = 1, -- 0 = black, 1 = white
 
     chapter_end_behavior = 1, -- 0 = stop at end, 1 = ask to continue, 2 = continue without asking
+    contrast = 1.0,
+
+    saturation = 1.0,
+
+    -- Async page-pipeline state. `_prefetch_gen` is bumped to cancel in-flight
+    -- fetches on chapter change / close; `_fetch_handles` maps page -> fetch
+    -- handle (so close can abort every live fetch); `_prefetch_chain_active`
+    -- prevents overlapping prefetch chains; `_page_fetch_inflight` /
+    -- `_page_fetch_failed` dedup and remember per-page fetch outcomes.
+    _prefetch_gen = 0,
+    _prefetch_chain_active = false,
+    _fetch_handles = nil,
+    _page_fetch_inflight = nil,
+    _page_fetch_failed = nil,
+    _page_fetch_retries = nil, -- transient-failure retry count per page
+    _pending_repaint_pages = nil,
+
+    -- Adaptive-network estimator: a ring of recent fetch outcomes drives the
+    -- prefetch depth, the >=50%-error pause, and visible-page preemption. See
+    -- _recordNetSample / _netErrRate / _netBw.
+    _net_samples = nil,
+    _net_prefetch_paused = false,
+
+    -- Async progress-POST pipeline state. The debounced POST runs through
+    -- AsyncFetch so it doesn't block the UI; `_inflight` + `_pending` form a
+    -- cooperative guard that prevents overlapping POSTs from landing out of
+    -- order on the server. `_handle` lets the close path cancel an in-flight
+    -- POST so the sync close POST is the last word.
+    _progress_post_inflight = false,
+    _progress_post_pending = false,
+    _progress_post_handle = nil,
 
     _failed_image_loads = {}, -- Track failed image pages to show error toast
     _pending_page_direction = nil, -- true=forward(top), false=backward(bottom), nil=no reposition
@@ -94,7 +167,15 @@ local KamareImageViewer = InputContainer:extend{
     },
 }
 
+-- Singleton guard
+KamareImageViewer.active_instance = nil
+
 function KamareImageViewer:init()
+    if KamareImageViewer.active_instance then
+        logger.warn("KamareImageViewer: instance already active, refusing duplicate")
+        return
+    end
+
     self:loadSettings()
 
     self._page_turns_since_open = 0
@@ -150,6 +231,7 @@ function KamareImageViewer:init()
 
     self.main_frame = FrameContainer:new{
         radius = not self.fullscreen and 8 or nil,
+        bordersize = 0,
         padding = 0,
         margin = 0,
         background = Blitbuffer.COLOR_WHITE,
@@ -173,6 +255,8 @@ function KamareImageViewer:init()
         }
     end
 
+    KamareImageViewer.active_instance = self
+
     self:update()
 
     UIManager:nextTick(function()
@@ -188,10 +272,8 @@ function KamareImageViewer:init()
 end
 
 function KamareImageViewer:_initDocument()
-    local has_valid_images_data = true
     if not self.images_list_data then
         logger.err("KamareImageViewer: No images_list_data provided. Displaying empty screen.")
-        has_valid_images_data = false
         self.images_list_data = { function() return nil end }
         self.images_list_nb = 1
     end
@@ -206,7 +288,6 @@ function KamareImageViewer:_initDocument()
         title = self.title,
         cache_id = cache_id,
         cache_mod_time = 0,
-        render_quality = self.render_quality or -1,
         content_type = self.metadata and self.metadata.content_type or "auto",
         on_image_load_error = function(pageno, error_msg)
             self:onImageLoadError(pageno, error_msg)
@@ -217,33 +298,47 @@ function KamareImageViewer:_initDocument()
         logger.err("KamareImageViewer: Failed to initialize VirtualImageDocument. Displaying empty screen.")
     end
 
+    self.virtual_document.gamma = self.contrast or 1.0
+    self.virtual_document.saturation = self.saturation or 1.0
+
     self:_updatePageCount()
     self._images_list_cur = Math.clamp((self.metadata and self.metadata.startPage) or 1, 1, self._images_list_nb)
 
-    if has_valid_images_data and G_reader_settings:isTrue("imageviewer_rotate_auto_for_best_fit") then
-        local dims = self.virtual_document:getNativePageDimensions(self._images_list_cur)
-        if dims then
-            self.rotated = (Screen:getWidth() > Screen:getHeight()) ~= (dims.w > dims.h)
-        end
-    end
+    -- Fresh per-chapter fetch/network state: reset so a page marked
+    -- failed/inflight in one chapter can't leak into the next.
+    self._page_fetch_inflight    = {}
+    self._page_fetch_failed     = {}
+    self._page_fetch_retries    = {}
+    self._fetch_handles         = {}
+    self._pending_repaint_pages = {}
+    self._net_samples           = {}
+    self._net_prefetch_paused   = false
 end
 
 function KamareImageViewer:_initCanvas()
     local bg_color = self.background_color == 1 and Blitbuffer.COLOR_WHITE or Blitbuffer.COLOR_BLACK
     self.canvas = VirtualPageCanvas:new{
         document = self.virtual_document,
-        padding = self.page_padding,
-        horizontal_margin = self.scroll_margin,
+        h_margin = self.h_margin,
+        top_margin = self.top_margin,
+        bottom_margin = self.bottom_margin,
+        dual_page_gap = self.dual_page_gap,
         background = bg_color,
         view_mode = self.view_mode,
         page_direction = self.page_direction,
         page_gap_height = self.page_gap_height,
+        render_quality = self.render_quality or -1,
     }
 
     self.canvas_container = CenterContainer:new{
         dimen = Geom:new{ w = self.width, h = self.height },
         self.canvas,
     }
+
+    -- Wire the render-path "pending" callback: when the canvas paints a page
+    -- whose image isn't cached yet, request it async; on arrival a setDirty
+    -- repaint renders the real page where the placeholder glyph was.
+    self.canvas.on_pending_page = function(page) self:_onPendingRenderPage(page) end
 
     self.image_container = self.canvas_container
 end
@@ -402,10 +497,14 @@ function KamareImageViewer:loadSettings()
     self.configurable.page_direction = self.page_direction
     self.configurable.zoom_mode_type = self.zoom_mode
     self.configurable.page_gap_height = self.page_gap_height
+    self.configurable.dual_page_gap = self.dual_page_gap
     self.configurable.scroll_distance = self.scroll_distance
-    self.configurable.scroll_margin = self.scroll_margin
-    self.configurable.page_padding = self.page_padding
+    self.configurable.h_margin = self.h_margin
+    self.configurable.top_margin = self.top_margin
+    self.configurable.bottom_margin = self.bottom_margin
     self.configurable.render_quality = self.render_quality or -1
+    self.configurable.contrast = self.contrast or 1.0
+    self.configurable.color_boost = self.saturation or 1.0
     self.configurable.background_color = self.background_color
     self.configurable.rotation_lock = false
     self.configurable.chapter_end_behavior = self.chapter_end_behavior
@@ -419,9 +518,13 @@ function KamareImageViewer:loadSettings()
     self.zoom_mode = self.configurable.zoom_mode_type or 0
     self.page_gap_height = self.configurable.page_gap_height or 8
     self.scroll_distance = self.configurable.scroll_distance or 25
-    self.scroll_margin = self.configurable.scroll_margin or 0
-    self.page_padding = self.configurable.page_padding or 0
+    self.h_margin = self.configurable.h_margin or 0
+    self.top_margin = self.configurable.top_margin or 0
+    self.bottom_margin = self.configurable.bottom_margin or 0
+    self.dual_page_gap = self.configurable.dual_page_gap or 5
     self.render_quality = self.configurable.render_quality or -1
+    self.contrast = self.configurable.contrast or 1.0
+    self.saturation = self.configurable.color_boost or 1.0
     self.background_color = self.configurable.background_color or 1
     self.rotation_locked = self.configurable.rotation_lock or false
     self.chapter_end_behavior = self.configurable.chapter_end_behavior or 1
@@ -441,10 +544,14 @@ function KamareImageViewer:syncAndSaveSettings()
     self.configurable.page_direction = self.page_direction
     self.configurable.zoom_mode_type = self.zoom_mode
     self.configurable.page_gap_height = self.page_gap_height
+    self.configurable.dual_page_gap = self.dual_page_gap
     self.configurable.scroll_distance = self.scroll_distance
-    self.configurable.scroll_margin = self.scroll_margin
-    self.configurable.page_padding = self.page_padding
+    self.configurable.h_margin = self.h_margin
+    self.configurable.top_margin = self.top_margin
+    self.configurable.bottom_margin = self.bottom_margin
     self.configurable.render_quality = self.render_quality
+    self.configurable.contrast = self.contrast
+    self.configurable.color_boost = self.saturation
     self.configurable.background_color = self.background_color
     self.configurable.rotation_lock = self.rotation_locked
     self.configurable.chapter_end_behavior = self.chapter_end_behavior
@@ -576,7 +683,7 @@ function KamareImageViewer:getFooterState()
     if self.view_mode == 1 and self.canvas and self.virtual_document then
         local zoom = self:getCurrentZoom()
         local viewport_w, viewport_h = self.canvas:getViewportSize()
-        local total = self.virtual_document:getVirtualHeight(zoom, self:_getRotationAngle(), self.zoom_mode, viewport_w)
+        local total = self.virtual_document:getVirtualHeight(zoom, self.zoom_mode, viewport_w, self.page_gap_height)
         if total > 0 then
             -- Use bottom of viewport for progress calculation so 100% is reached at the end
             local pos = (self.scroll_offset or 0) + viewport_h
@@ -599,17 +706,24 @@ function KamareImageViewer:getFooterState()
         end
     end
 
-    local remaining = total_pages - display_page
-    if self.view_mode == 2 and self.virtual_document then
-        for p = display_page + 1, total_pages do
-            local _, p_right = self.canvas:getDualPagePair(p)
-            if p_right == -1 then
-                remaining = remaining + 1  -- Landscape counts as 2 pages
+    local time_estimate
+    -- The dual-page "remaining" loop below is O(remaining) per call, which
+    -- is wasteful when the active footer mode doesn't display time-to-read.
+    -- Only compute it (and the estimate) when actually needed.
+    if self.footer and self.footer:getMode() == KamareFooter.MODE.book_time_to_read then
+        local remaining = total_pages - display_page
+        if self.view_mode == 2 and self.virtual_document then
+            for p = display_page + 1, total_pages do
+                local _, p_right = self.canvas:getDualPagePair(p)
+                if p_right == -1 then
+                    remaining = remaining + 1  -- Landscape counts as 2 pages
+                end
             end
         end
+        time_estimate = self:getTimeEstimate(remaining)
+    else
+        time_estimate = _("N/A")
     end
-
-    local time_estimate = self:getTimeEstimate(remaining)
 
     local footer_state = {
         current_page = display_page,
@@ -619,15 +733,32 @@ function KamareImageViewer:getFooterState()
         scroll_progress = scroll_progress,
         time_estimate = time_estimate,
         is_rtl_mode = (self.page_direction == 1) or false,
+        -- Live reference to the document's fully-cached page set; the footer
+        -- reads this to paint the prefetched-pages overlay on the progress bar.
+        cached_pages = self.virtual_document and self.virtual_document._fully_cached_pages or nil,
     }
 
     return footer_state
 end
 
 function KamareImageViewer:updateFooter()
-    if self.footer and self.footer:update(self:getFooterState()) then
-        UIManager:setDirty(self, "ui", self.footer:getWidget().dimen)
+    if not self.footer then return end
+    -- Coalesce multiple calls within the same UI tick. Rapid scrolling can
+    -- fire updateFooter many times in quick succession; only the latest
+    -- state needs to reach the footer. The pending flag deduplicates, and
+    -- the callback reference is kept so onCloseWidget can unschedule it.
+    if self._footer_update_pending then return end
+    if not self._footer_update_func then
+        self._footer_update_func = function()
+            self._footer_update_pending = false
+            if not self.footer then return end
+            if self.footer:update(self:getFooterState()) then
+                UIManager:setDirty(self, "ui", self.footer:getWidget().dimen)
+            end
+        end
     end
+    self._footer_update_pending = true
+    UIManager:nextTick(self._footer_update_func)
 end
 
 function KamareImageViewer:getCurrentFooterMode()
@@ -787,9 +918,11 @@ function KamareImageViewer:onShowConfigMenu()
     self.configurable.page_direction = self.page_direction
     self.configurable.zoom_mode_type = self.zoom_mode
     self.configurable.page_gap_height = self.page_gap_height
+    self.configurable.dual_page_gap = self.dual_page_gap
     self.configurable.scroll_distance = self.scroll_distance
-    self.configurable.scroll_margin = self.scroll_margin
-    self.configurable.page_padding = self.page_padding
+    self.configurable.h_margin = self.h_margin
+    self.configurable.top_margin = self.top_margin
+    self.configurable.bottom_margin = self.bottom_margin
     self.configurable.background_color = self.background_color
     self.configurable.rotation_lock = self.rotation_locked
     self.configurable.chapter_end_behavior = self.chapter_end_behavior
@@ -851,18 +984,34 @@ function KamareImageViewer:onConfigCloseCallback()
 
     local needs_update = false
 
-    if self.configurable.page_padding ~= nil and self.configurable.page_padding ~= self.page_padding then
-        self.page_padding = self.configurable.page_padding
+    if self.configurable.h_margin ~= nil and self.configurable.h_margin ~= self.h_margin then
+        self.h_margin = self.configurable.h_margin
         if self.canvas then
-            self.canvas:setPadding(self.page_padding)
+            self.canvas:setHMargin(self.h_margin)
         end
         needs_update = true
     end
 
-    if self.configurable.scroll_margin ~= nil and self.configurable.scroll_margin ~= self.scroll_margin then
-        self.scroll_margin = self.configurable.scroll_margin
+    if self.configurable.top_margin ~= nil and self.configurable.top_margin ~= self.top_margin then
+        self.top_margin = self.configurable.top_margin
         if self.canvas then
-            self.canvas:setHorizontalMargin(self.scroll_margin)
+            self.canvas:setTopMargin(self.top_margin)
+        end
+        needs_update = true
+    end
+
+    if self.configurable.bottom_margin ~= nil and self.configurable.bottom_margin ~= self.bottom_margin then
+        self.bottom_margin = self.configurable.bottom_margin
+        if self.canvas then
+            self.canvas:setBottomMargin(self.bottom_margin)
+        end
+        needs_update = true
+    end
+
+    if self.configurable.dual_page_gap ~= nil and self.configurable.dual_page_gap ~= self.dual_page_gap then
+        self.dual_page_gap = self.configurable.dual_page_gap
+        if self.canvas then
+            self.canvas:setDualPageGap(self.dual_page_gap)
         end
         needs_update = true
     end
@@ -930,8 +1079,46 @@ function KamareImageViewer:onSetRenderQuality(quality)
     self.configurable.render_quality = q
     self:syncAndSaveSettings()
 
+    -- render_quality lives on the canvas (projection concern).
+    -- Tiles are keyed by render_quality, so a change invalidates them.
+    if self.canvas then
+        self.canvas:setRenderQuality(q)
+    end
     if self.virtual_document then
-        self.virtual_document.render_quality = q
+        self.virtual_document:clearCache()
+    end
+
+    return true
+end
+
+function KamareImageViewer:onSetContrast(value)
+    local v = tonumber(value)
+    if not v then return false end
+    if v == self.contrast then return true end
+
+    self.contrast = v
+    self.configurable.contrast = v
+    self:syncAndSaveSettings()
+
+    if self.virtual_document then
+        self.virtual_document.gamma = v
+        self.virtual_document:clearCache()
+    end
+
+    return true
+end
+
+function KamareImageViewer:onSetColorBoost(value)
+    local v = tonumber(value)
+    if not v then return false end
+    if v == self.saturation then return true end
+
+    self.saturation = v
+    self.configurable.color_boost = v
+    self:syncAndSaveSettings()
+
+    if self.virtual_document then
+        self.virtual_document.saturation = v
         self.virtual_document:clearCache()
     end
 
@@ -1050,44 +1237,83 @@ function KamareImageViewer:onScrollDistanceUpdate(value)
     return true
 end
 
-function KamareImageViewer:onScrollMarginUpdate(value)
+function KamareImageViewer:onHMarginUpdate(value)
     local margin = tonumber(value)
     if not margin then return false end
     margin = math.max(0, margin)
-    if margin == self.scroll_margin then return true end
+    if margin == self.h_margin then return true end
 
-    self.scroll_margin = margin
-    self.configurable.scroll_margin = margin
+    self.h_margin = margin
+    self.configurable.h_margin = margin
     self:syncAndSaveSettings()
 
     if self.canvas then
-        self.canvas:setHorizontalMargin(margin)
-    end
-
-    if self.view_mode == 1 then
-        self._pending_scroll_page = self._images_list_cur
-        self:update()
-    end
-
-    return true
-end
-
-function KamareImageViewer:onPagePaddingUpdate(value)
-    local padding = tonumber(value)
-    if not padding then return false end
-    padding = math.max(0, padding)
-    if padding == self.page_padding then return true end
-
-    self.page_padding = padding
-    self.configurable.page_padding = padding
-    self:syncAndSaveSettings()
-
-    if self.canvas then
-        self.canvas:setPadding(padding)
+        self.canvas:setHMargin(margin)
     end
 
     self._pending_scroll_page = self._images_list_cur
     self:update()
+
+    return true
+end
+
+function KamareImageViewer:onTopMarginUpdate(value)
+    local margin = tonumber(value)
+    if not margin then return false end
+    margin = math.max(0, margin)
+    if margin == self.top_margin then return true end
+
+    self.top_margin = margin
+    self.configurable.top_margin = margin
+    self:syncAndSaveSettings()
+
+    if self.canvas then
+        self.canvas:setTopMargin(margin)
+    end
+
+    self._pending_scroll_page = self._images_list_cur
+    self:update()
+
+    return true
+end
+
+function KamareImageViewer:onBottomMarginUpdate(value)
+    local margin = tonumber(value)
+    if not margin then return false end
+    margin = math.max(0, margin)
+    if margin == self.bottom_margin then return true end
+
+    self.bottom_margin = margin
+    self.configurable.bottom_margin = margin
+    self:syncAndSaveSettings()
+
+    if self.canvas then
+        self.canvas:setBottomMargin(margin)
+    end
+
+    self._pending_scroll_page = self._images_list_cur
+    self:update()
+
+    return true
+end
+
+function KamareImageViewer:onDualPageGapUpdate(value)
+    local gap = tonumber(value)
+    if not gap then return false end
+    gap = math.max(0, gap)
+    if gap == self.dual_page_gap then return true end
+
+    self.dual_page_gap = gap
+    self.configurable.dual_page_gap = gap
+    self:syncAndSaveSettings()
+
+    if self.canvas then
+        self.canvas:setDualPageGap(gap)
+    end
+
+    if self.view_mode == 2 then
+        self:update()
+    end
 
     return true
 end
@@ -1113,7 +1339,6 @@ function KamareImageViewer:onSetBackgroundColor(value)
     return true
 end
 
--- opens the frontlight widget
 function KamareImageViewer:onShowFrontlight()
     UIManager:show(FrontlightWidget:new {})
     return true
@@ -1158,8 +1383,11 @@ function KamareImageViewer:_scrollStep(direction)
     local zoom = self:getCurrentZoom()
     local step_ratio = (self.scroll_distance or 25) / 100
     local step = math.max(viewport_h * step_ratio, 1)
-    local total = self.virtual_document:getVirtualHeight(zoom, self:_getRotationAngle(), self.zoom_mode, viewport_w) or 0
+    local total = self.virtual_document:getVirtualHeight(zoom, self.zoom_mode, viewport_w, self.page_gap_height) or 0
     local offset = self.scroll_offset or 0
+
+    logger.dbg(string.format("[kamare:scroll] step dir=%d page=%d offset=%d/%d zoom=%.3f",
+        direction, self._images_list_cur or -1, math.floor(offset), math.floor(math.max(0, total - viewport_h)), zoom))
 
     if direction > 0 then
         local max_offset = math.max(0, total - viewport_h)
@@ -1198,7 +1426,7 @@ function KamareImageViewer:_scrollToPage(page)
 
     local zoom = self:getCurrentZoom()
     local viewport_w = self.canvas and select(1, self.canvas:getViewportSize()) or 0
-    local offset = self.virtual_document:getScrollPositionForPage(page, zoom, self:_getRotationAngle(), self.zoom_mode, viewport_w)
+    local offset = self.virtual_document:getScrollPositionForPage(page, zoom, self.zoom_mode, viewport_w, self.page_gap_height)
 
     self:_setScrollOffset(offset, { silent = true })
     self:_updatePageFromScroll(true)
@@ -1211,7 +1439,7 @@ function KamareImageViewer:_updatePageFromScroll(silent)
     local zoom = self:getCurrentZoom()
     local viewport_w, viewport_h = self.canvas and self.canvas:getViewportSize() or 0, 0
     local check_offset = (self.scroll_offset or 0) + viewport_h
-    local new_page = self.virtual_document:getPageAtOffset(check_offset, zoom, self:_getRotationAngle(), self.zoom_mode, viewport_w)
+    local new_page = self.virtual_document:getPageAtOffset(check_offset, zoom, self.zoom_mode, viewport_w, self.page_gap_height)
 
     local max_offset = self.canvas and self.canvas:getMaxScrollOffset() or 0
     local at_max = math.abs((self.scroll_offset or 0) - max_offset) < 1
@@ -1223,8 +1451,8 @@ function KamareImageViewer:_updatePageFromScroll(silent)
     local should_prefetch = false
 
     if self._images_list_cur < self._images_list_nb then
-        local current_page_start = self.virtual_document:getScrollPositionForPage(self._images_list_cur, zoom, self:_getRotationAngle(), self.zoom_mode, viewport_w)
-        local next_page_start = self.virtual_document:getScrollPositionForPage(self._images_list_cur + 1, zoom, self:_getRotationAngle(), self.zoom_mode, viewport_w)
+        local current_page_start = self.virtual_document:getScrollPositionForPage(self._images_list_cur, zoom, self.zoom_mode, viewport_w, self.page_gap_height)
+        local next_page_start = self.virtual_document:getScrollPositionForPage(self._images_list_cur + 1, zoom, self.zoom_mode, viewport_w, self.page_gap_height)
         local current_page_height = next_page_start - current_page_start
 
         if current_page_height > 0 then
@@ -1246,6 +1474,7 @@ function KamareImageViewer:_updatePageFromScroll(silent)
 
     if new_page ~= self._images_list_cur then
         if not silent then self:recordViewingTimeIfValid() end
+        logger.dbg(string.format("[kamare:scroll] page %d -> %d (trigger prefetch)", self._images_list_cur or -1, new_page))
         self._images_list_cur = new_page
         self.current_image_start_time = os.time()
         self:updateFooter()
@@ -1263,17 +1492,18 @@ function KamareImageViewer:_updatePageFromScroll(silent)
     end
 
     if should_prefetch then
+        logger.dbg(string.format("[kamare:scroll] mid-page prefetch triggered at page %d (progress-based)", self._images_list_cur))
         UIManager:tickAfterNext(function() self:prefetchUpcomingTiles() end)
     end
+
+    self:_updateReaderContext()
 end
 
 function KamareImageViewer:_updateCanvasState()
     if not (self.canvas and self.virtual_document) then return end
 
     local page = Math.clamp(self._images_list_cur or 1, 1, self._images_list_nb or 1)
-    local rotation = self:_getRotationAngle()
 
-    self.canvas:setRotation(rotation)
     self.canvas:setZoomMode(self.zoom_mode)
     self.canvas:setPage(page)
     self.canvas:setSize{
@@ -1309,21 +1539,21 @@ function KamareImageViewer:_updateCanvasState()
             local viewport_w = select(1, self.canvas:getViewportSize())
             local total_pages = self._images_list_nb or 0
             local page_start = self.virtual_document:getScrollPositionForPage(
-                anchor.page, self.current_zoom, rotation, self.zoom_mode, viewport_w)
+                anchor.page, self.current_zoom, self.zoom_mode, viewport_w, self.page_gap_height)
             local next_start
             if anchor.page >= total_pages then
                 next_start = self.virtual_document:getVirtualHeight(
-                    self.current_zoom, rotation, self.zoom_mode, viewport_w)
+                    self.current_zoom, self.zoom_mode, viewport_w, self.page_gap_height)
             else
                 next_start = self.virtual_document:getScrollPositionForPage(
-                    anchor.page + 1, self.current_zoom, rotation, self.zoom_mode, viewport_w)
+                    anchor.page + 1, self.current_zoom, self.zoom_mode, viewport_w, self.page_gap_height)
             end
             desired = math.floor(page_start + anchor.frac * (next_start - page_start) + 0.5)
             self._pending_scroll_anchor = nil
             self._pending_scroll_page = nil
         elseif self._pending_scroll_page then
             local viewport_w = select(1, self.canvas:getViewportSize())
-            desired = self.virtual_document:getScrollPositionForPage(self._pending_scroll_page, self.current_zoom, rotation, self.zoom_mode, viewport_w)
+            desired = self.virtual_document:getScrollPositionForPage(self._pending_scroll_page, self.current_zoom, self.zoom_mode, viewport_w, self.page_gap_height)
             self._pending_scroll_page = nil
         end
         desired = self:_clampScrollOffset(desired)
@@ -1341,6 +1571,78 @@ function KamareImageViewer:_updateCanvasState()
         end
         self:updateFooter()
     end
+
+    self:_updateReaderContext()
+end
+
+-- The set of pages currently intersecting the viewport (single page in page
+-- mode, the spread in dual mode, every straddling page in scroll mode).
+-- Shared by the cache-protection update and the prefetch visible-preemption
+-- gate so they never disagree about what "visible" means.
+function KamareImageViewer:_currentVisiblePages()
+    if not self.virtual_document then return {} end
+
+    local pages = {}
+    if self.view_mode == 1 then
+        if self.canvas then
+            local zoom = self:getCurrentZoom()
+            local viewport_w, viewport_h = self.canvas:getViewportSize()
+            if viewport_h > 0 then
+                local visible = self.virtual_document:getVisiblePagesAtOffset(
+                    self.scroll_offset or 0, viewport_h, zoom, self.zoom_mode,
+                    viewport_w, self.page_gap_height) or {}
+                for _, vi in ipairs(visible) do
+                    if vi.page_num then
+                        pages[#pages + 1] = vi.page_num
+                    end
+                end
+            end
+        end
+    elseif self.view_mode == 2 then
+        if self.canvas then
+            local lp, rp = self.canvas:getDualPagePair(self._images_list_cur or 1)
+            if lp and lp > 0 then
+                pages[#pages + 1] = lp
+            end
+            if rp and rp > 0 then
+                pages[#pages + 1] = rp
+            end
+        end
+    else
+        local p = self._images_list_cur
+        if p and p > 0 then
+            pages[#pages + 1] = p
+        end
+    end
+    return pages
+end
+
+-- Push the reader's current position to VIDCache so its eviction is
+-- position-aware (behind-the-reader pages and stale other-chapter tiles are
+-- evicted before the read-ahead window). `current_page` is the last visible
+-- page, matching calculateAdaptivePrefetch's notion of the read anchor.
+-- Call this on layout changes (scroll/zoom/page-turn) and at the top of each
+-- prefetch step so the policy tracks the live reader position.
+function KamareImageViewer:_updateReaderContext()
+    if not (self.virtual_document and VIDCache) then return end
+    local visible = self:_currentVisiblePages()
+    local cur = 0
+    local vis_set = {}
+    for _, p in ipairs(visible) do
+        if p and p > 0 then
+            vis_set[p] = true
+            if p > cur then cur = p end
+        end
+    end
+    if cur == 0 then
+        cur = self._images_list_cur or 1
+    end
+    VIDCache:setReaderContext({
+        doc_path      = self.virtual_document.file,
+        current_page  = cur,
+        visible_pages = vis_set,
+        behind_keep   = EVICT_BEHIND_KEEP,
+    })
 end
 
 function KamareImageViewer:update()
@@ -1389,31 +1691,29 @@ function KamareImageViewer:updateImageOnly()
     UIManager:setDirty(self, "partial", self.canvas.dimen)
 end
 
-function KamareImageViewer:estimatePageTileCount(pageno)
-    local native_dims = self.virtual_document:getNativePageDimensions(pageno)
-
-    if not native_dims or native_dims.w <= 0 or native_dims.h <= 0 then
-        return 1
+-- Estimated encoded size (bytes) of a page's full tile set at its current
+-- render resolution, or 0 if dims aren't available yet.
+function KamareImageViewer:_estimatePageBytes(page)
+    local native_dims = self.virtual_document:getNativePageDimensions(page)
+    if native_dims and native_dims.w > 0 and native_dims.h > 0 then
+        local rw, rh = self.canvas:_renderDimsFor(native_dims.w, native_dims.h)
+        return self.virtual_document:estimateBytesForPage(page, rw, rh)
     end
-
-    local render_w, render_h = self.virtual_document:_calculateRenderDimensions(native_dims)
-    local tile_px = self.virtual_document.tile_px or 1024
-    local tiles_x = math.ceil(render_w / tile_px)
-    local tiles_y = math.ceil(render_h / tile_px)
-    local tile_count = tiles_x * tiles_y
-
-    return tile_count
+    return 0
 end
 
 function KamareImageViewer:calculateAdaptivePrefetch()
+    if not (self.virtual_document and self.canvas) then return {} end
+
     local zoom = self:getCurrentZoom()
-    local rotation = self:_getRotationAngle()
-
     local current_page = self._images_list_cur
+    local visible = {}
 
-    if self.view_mode == 1 and self.canvas then
+    if self.view_mode == 1 then
         local viewport_w, viewport_h = self.canvas:getViewportSize()
-        local visible = self.virtual_document:getVisiblePagesAtOffset(self.scroll_offset or 0, viewport_h, zoom, rotation, self.zoom_mode, viewport_w) or {}
+        visible = self.virtual_document:getVisiblePagesAtOffset(
+            self.scroll_offset or 0, viewport_h, zoom, self.zoom_mode, viewport_w,
+            self.page_gap_height) or {}
         if #visible > 0 then
             current_page = visible[#visible].page_num
         end
@@ -1421,100 +1721,170 @@ function KamareImageViewer:calculateAdaptivePrefetch()
 
     local next_page = current_page + 1
     if next_page > self._images_list_nb then
+        logger.dbg(string.format("[kamare:prefetch] decision cur=%d no-next-page (last page)", current_page))
         return {}
     end
 
-    -- Calculate target buffer size: maintain X tiles ahead for smooth forward reading
-    local cache_size_bytes = VIDCache:getCacheSize()
-    local bytes_per_tile = 4 * 1024 * 1024
-    local max_buffer_tiles = math.floor((cache_size_bytes * 0.75) / bytes_per_tile)
-
-    max_buffer_tiles = math.max(12, math.min(60, max_buffer_tiles))
-
-    -- Gradual ramp-up: start small and increase buffer target as user reads
-    local page_turns = self._page_turns_since_open or 0
-    local target_buffer_tiles
-
-    if page_turns <= 2 then
-        target_buffer_tiles = math.min(3, max_buffer_tiles)
-    elseif page_turns <= 5 then
-        target_buffer_tiles = math.floor(max_buffer_tiles * 0.25)
-    elseif page_turns <= 10 then
-        target_buffer_tiles = math.floor(max_buffer_tiles * 0.50)
-    elseif page_turns <= 15 then
-        target_buffer_tiles = math.floor(max_buffer_tiles * 0.75)
-    else
-        target_buffer_tiles = max_buffer_tiles
+    -- Network-quality gate: when recent fetches are failing >= half the time,
+    -- stop speculating entirely -- the visible page still loads via the render
+    -- path, and we avoid wasting bytes (and contending the flaky pipe) on pages
+    -- the user may never reach. Clears as soon as fresh successes age out the
+    -- failures; the next scroll/page-turn re-kicks the chain.
+    if self:_netSampleCount() >= NET_PAUSE_MIN_SAMPLES
+       and self:_netErrRate() >= NET_PAUSE_ERR_RATE then
+        if not self._net_prefetch_paused then
+            self._net_prefetch_paused = true
+            logger.dbg(string.format(
+                "[kamare:net] err_rate=%.0f%% >= %d%% -> prefetch paused (bw=%.0fKB/s)",
+                self:_netErrRate() * 100, NET_PAUSE_ERR_RATE * 100, self:_netBw() / 1024))
+        end
+        return {}
+    end
+    if self._net_prefetch_paused then
+        self._net_prefetch_paused = false
+        logger.dbg("[kamare:net] link recovered -> prefetch resumed")
     end
 
-    local tiles_cached_ahead = 0
-    local pages_cached_ahead = 0
+    -- Adaptive depth: scale the byte budget by measured throughput/error rate,
+    -- and tighten how far ahead we look. Fast+clean links keep the full budget;
+    -- slow/flaky links shrink toward a floor (still warming the immediate next
+    -- page) and stop scanning distant pages.
+    local bw_factor = self:_netBwFactor()
+    local lookahead_cap = self:_netLookaheadCap()
 
-    for i = 0, 15 do
-        local check_page = next_page + i
+    -- Byte-accurate budget derived from the known virtual page layout.
+    -- Active reserve = bytes for the currently-visible tile slices (not whole
+    -- pages), so that very long webtoon images don't reserve their entire
+    -- 30-tile page just because a single tile row is on screen. Without this,
+    -- prefetch + active demand exceeds the cache cap, the LRU evicts the
+    -- oldest (active!) tiles, and scroll-back forces a synchronous full-page
+    -- regen via _preSplitPageTiles.
+    local cache_bytes = VIDCache:getCacheSize()
+    local budget_bytes = math.floor(cache_bytes * BUDGET_FRACTION)
+                          - BUDGET_SAFETY_MARGIN_BYTES
+    if budget_bytes < 0 then budget_bytes = 0 end
 
-        if check_page > self._images_list_nb then
-            break
-        end
-
-        local is_cached = false
-        local native_dims = self.virtual_document:getNativePageDimensions(check_page)
-
-        if native_dims and native_dims.w > 0 then
-            local first_tile = Geom:new{x=0, y=0, w=1024, h=1024}
-            local hash = self.virtual_document:_tileHash(check_page, zoom, rotation, self.virtual_document.gamma, first_tile)
-
-            if VIDCache:getNativeTile(hash) then
-                is_cached = true
+    -- Active reserve: sum bytes for the on-screen slice of each visible page.
+    local active_bytes = 0
+    if self.view_mode == 1 then
+        for _, v in ipairs(visible) do
+            local native_dims = self.virtual_document:getNativePageDimensions(v.page_num)
+            if native_dims and native_dims.w > 0 and native_dims.h > 0
+                and v.zoom and v.zoom > 0
+                and v.visible_bottom > v.visible_top then
+                local render_w, render_h = self.canvas:_renderDimsFor(native_dims.w, native_dims.h)
+                -- Convert visible slice from display coords to render coords.
+                -- v.zoom is the per-page display zoom (native -> display).
+                local render_scale = render_w / native_dims.w
+                local display_to_render = render_scale / v.zoom
+                local display_top    = v.visible_top    - v.page_top
+                local display_bottom = v.visible_bottom - v.page_top
+                local render_y0 = math.max(0, math.floor(display_top * display_to_render))
+                local render_y1 = math.min(render_h, math.ceil(display_bottom * display_to_render))
+                if render_y1 > render_y0 then
+                    local rect = Geom:new{
+                        x = 0, y = render_y0,
+                        w = render_w, h = render_y1 - render_y0,
+                    }
+                    active_bytes = active_bytes +
+                        self.virtual_document:estimateBytesForRect(v.page_num, rect, render_w, render_h)
+                end
             end
         end
-
-        if is_cached then
-            local tile_count = self:estimatePageTileCount(check_page)
-            tiles_cached_ahead = tiles_cached_ahead + tile_count
-            pages_cached_ahead = pages_cached_ahead + 1
-        else
-            -- Stop at first gap - we want contiguous buffer
-            break
-        end
+    else
+        -- Page / dual page: the current page's full tile set is on screen.
+        active_bytes = self:_estimatePageBytes(current_page)
     end
 
-    -- Calculate how many tiles we need to add to reach target
-    local tiles_to_prefetch = target_buffer_tiles - tiles_cached_ahead
+    local budget_after_active = budget_bytes - active_bytes
+    if budget_after_active < 0 then budget_after_active = 0 end
 
-    if tiles_to_prefetch <= 0 then
+    -- Page-mode ramp-up: throttles prefetch depth for the first few page
+    -- turns to avoid spending RAM aggressively when the user might navigate
+    -- away. Scroll mode uses the full budget (chunked async fetch is
+    -- non-blocking, so there's no UI-freeze cost to aggressive prefetch).
+    local target_bytes
+    if self.view_mode == 1 then
+        target_bytes = budget_after_active
+    else
+        local page_turns = self._page_turns_since_open or 0
+        local ramp_fraction
+        if     page_turns <= 2  then ramp_fraction = 0.10
+        elseif page_turns <= 5  then ramp_fraction = 0.25
+        elseif page_turns <= 10 then ramp_fraction = 0.50
+        elseif page_turns <= 15 then ramp_fraction = 0.75
+        else                          ramp_fraction = 1.00 end
+        target_bytes = math.floor(budget_after_active * ramp_fraction)
+    end
+
+    -- Shrink the prefetch byte budget on slow/flaky links (bw_factor). The
+    -- floor (NET_BW_FACTOR_FLOOR) still allows warming the immediate next page.
+    target_bytes = math.floor(target_bytes * bw_factor)
+
+    -- Contiguous fully-cached run starting from next_page. The buffer must
+    -- stay contiguous; the first gap stops the run.
+    local pages_cached_ahead = 0
+    local bytes_cached_ahead = 0
+    for i = 0, lookahead_cap - 1 do
+        local check_page = next_page + i
+        if check_page > self._images_list_nb then break end
+        if not self.virtual_document:isPageFullyCached(check_page) then break end
+        pages_cached_ahead = pages_cached_ahead + 1
+        bytes_cached_ahead = bytes_cached_ahead + self:_estimatePageBytes(check_page)
+    end
+
+    local bytes_to_prefetch = target_bytes - bytes_cached_ahead
+    if bytes_to_prefetch <= 0 then
+        logger.dbg(string.format(
+            "[kamare:prefetch] decision cur=%d buffer-satisfied budget=%dB active=%dB target=%dB cached_ahead(pages=%d bytes=%dB) [bw=%.0fKB/s err=%.0f%% factor=%.2f]",
+            current_page, budget_bytes, active_bytes, target_bytes,
+            pages_cached_ahead, bytes_cached_ahead,
+            self:_netBw() / 1024, self:_netErrRate() * 100, bw_factor))
         return {}
     end
 
-    -- Cap per-operation prefetch to avoid UI lag, but always complete at least one page
-    local MAX_TILES_PER_OPERATION = 8
-
-    local accumulated_tiles = 0
+    -- Walk upcoming pages by cumulative bytes until the budget is exhausted.
+    -- No force-include: if even one page exceeds the remaining budget, the
+    -- buffer stays empty and the active reserve is prioritized (correct for
+    -- very long webtoon pages where prefetch must yield to on-screen state).
+    -- Inflight pages reserve bytes (they'll occupy the cache soon) but aren't
+    -- re-requested. Failed pages are silently skipped.
+    local SOFT_MAX_PAGES_PER_STEP = 4  -- bounds list size; chain fetches one page per step
     local pages_list = {}
+    local accumulated_bytes = 0
     local start_page = next_page + pages_cached_ahead
 
-    for i = 0, 15 do
+    for i = 0, lookahead_cap - 1 do
         local page_num = start_page + i
+        if page_num > self._images_list_nb then break end
+        if #pages_list >= SOFT_MAX_PAGES_PER_STEP then break end
 
-        if page_num > self._images_list_nb then
-            break
-        end
+        local is_inflight = self._page_fetch_inflight[page_num]
+        local is_failed   = self._page_fetch_failed[page_num]
 
-        local tile_count = self:estimatePageTileCount(page_num)
+        -- Permanently-broken pages are skipped silently and we keep scanning
+        -- (re-trying a failed page would just spin).
+        if not is_failed then
+            local page_bytes = self:_estimatePageBytes(page_num)
 
-        -- Always include first page (guarantee at least one complete page, even if it exceeds cap)
-        -- For subsequent pages, respect the per-operation cap to avoid lag
-        if #pages_list == 0 then
-            accumulated_tiles = accumulated_tiles + tile_count
-            table.insert(pages_list, page_num)
-        elseif accumulated_tiles + tile_count <= MAX_TILES_PER_OPERATION and accumulated_tiles + tile_count <= tiles_to_prefetch then
-            accumulated_tiles = accumulated_tiles + tile_count
-            table.insert(pages_list, page_num)
-        else
-            -- Would exceed cap - stop here
-            break
+            if accumulated_bytes + page_bytes > bytes_to_prefetch then
+                break  -- would exceed budget
+            end
+            accumulated_bytes = accumulated_bytes + page_bytes
+
+            if not is_inflight then
+                table.insert(pages_list, page_num)
+            end
+            -- Inflight pages reserve bytes but aren't added (already being fetched).
         end
     end
+
+    logger.dbg(string.format(
+        "[kamare:prefetch] decision cur=%d budget=%dB active=%dB target=%dB cached_ahead(pages=%d bytes=%dB) want=%dB selected=[%s] [bw=%.0fKB/s err=%.0f%% factor=%.2f cap=%d]",
+        current_page, budget_bytes, active_bytes, target_bytes,
+        pages_cached_ahead, bytes_cached_ahead, bytes_to_prefetch,
+        table.concat(pages_list, ","),
+        self:_netBw() / 1024, self:_netErrRate() * 100, bw_factor, lookahead_cap))
 
     return pages_list
 end
@@ -1524,6 +1894,10 @@ function KamareImageViewer:prefetchUpcomingTiles()
         return
     end
 
+    -- Refresh the reader-position context before the chain starts inserting
+    -- tiles, so position-aware eviction uses the live reader position.
+    self:_updateReaderContext()
+
     local pages_to_prefetch = self:calculateAdaptivePrefetch()
 
     if #pages_to_prefetch == 0 then
@@ -1531,7 +1905,7 @@ function KamareImageViewer:prefetchUpcomingTiles()
     end
 
     UIManager:tickAfterNext(function()
-        self:prefetchUpcomingTilesSynchronous()
+        self:kickPrefetchChain()
     end)
 end
 
@@ -1541,14 +1915,12 @@ function KamareImageViewer:_initialPrefetchBuffer()
     end
 
     local pages_to_prefetch = self:calculateAdaptivePrefetch()
-
     if #pages_to_prefetch == 0 then
         return
     end
 
     -- For initial load, only prefetch 1 page (or 2 in dual page mode) to avoid long waits
     local initial_limit = (self.view_mode == 2) and 2 or 1
-
     if #pages_to_prefetch > initial_limit then
         local limited_list = {}
         for i = 1, initial_limit do
@@ -1557,38 +1929,358 @@ function KamareImageViewer:_initialPrefetchBuffer()
         pages_to_prefetch = limited_list
     end
 
-    for _, page_num in ipairs(pages_to_prefetch) do
-        self:_prefetchPageSynchronous(page_num)
+    logger.dbg(string.format("[kamare:prefetch] initial pages=[%s]", table.concat(pages_to_prefetch, ",")))
+    local gen = self._prefetch_gen
+    local i = 1
+    local function do_one()
+        if i > #pages_to_prefetch then return end
+        if gen ~= self._prefetch_gen or not self.virtual_document then return end
+        local page = pages_to_prefetch[i]
+        i = i + 1
+        self:_ensurePageReady(page, gen, do_one)
+    end
+    do_one()
+end
+
+-- Adaptive-network estimator. A ring of the last NET_SAMPLE_WINDOW fetch
+-- outcomes ({ok=bool, bw=bytes_per_sec}) drives prefetch depth, the error-rate
+-- pause, and visible-page preemption. EWMA is deliberately avoided in favour
+-- of an explicit window so the ">=50% recent failures" pause decision is
+-- predictable and recovers as soon as fresh successes age the failures out.
+function KamareImageViewer:_recordNetSample(ok, bw_Bps)
+    self._net_samples = self._net_samples or {}
+    local s = { ok = ok and true or false, bw = tonumber(bw_Bps) or 0 }
+    table.insert(self._net_samples, s)
+    -- trim to window (keep most recent)
+    while #self._net_samples > NET_SAMPLE_WINDOW do
+        table.remove(self._net_samples, 1)
     end
 end
 
-function KamareImageViewer:_prefetchPageSynchronous(page_num)
-    if not self.virtual_document then
-        return 0
+function KamareImageViewer:_netSampleCount()
+    return self._net_samples and #self._net_samples or 0
+end
+
+-- Fraction of recent samples that failed. 0 when we have no samples.
+function KamareImageViewer:_netErrRate()
+    local samples = self._net_samples
+    if not samples or #samples == 0 then return 0 end
+    local fails = 0
+    for _, s in ipairs(samples) do
+        if not s.ok then fails = fails + 1 end
+    end
+    return fails / #samples
+end
+
+-- Mean throughput (bytes/sec) over recent *successful* samples. 0 if none.
+function KamareImageViewer:_netBw()
+    local samples = self._net_samples
+    if not samples then return 0 end
+    local sum, n = 0, 0
+    for _, s in ipairs(samples) do
+        if s.ok and s.bw > 0 then
+            sum = sum + s.bw
+            n = n + 1
+        end
+    end
+    return n > 0 and (sum / n) or 0
+end
+
+-- Classify the current link into one of 4 tiers (3 = fast+clean .. 0 = poor)
+-- from the shared throughput/error thresholds. No samples (fresh chapter) is
+-- treated as top tier so the initial prefetch buffer is aggressive; we scale
+-- down once real measurements show the link is slow or erroring.
+function KamareImageViewer:_netTier()
+    if self:_netSampleCount() == 0 then return 3 end
+    local bw, err = self:_netBw(), self:_netErrRate()
+    local KB = 1024
+    if    bw >= 1024 * KB and err < 0.10 then return 3
+    elseif bw >=  256 * KB and err < 0.25 then return 2
+    elseif bw >=   64 * KB or  err < 0.50 then return 1
+    else                                     return 0
+    end
+end
+
+-- Prefetch depth multiplier (fast+clean links get the full budget; slow or
+-- erroring links scale down toward the floor so the immediate-next page can
+-- still be warmed without flooding a dropping pipe).
+function KamareImageViewer:_netBwFactor()
+    return NET_BW_FACTOR_BY_TIER[self:_netTier()]
+end
+
+-- Lookahead horizon (max pages ahead to scan/prefetch), tightened on poor
+-- links so we don't commit bytes to pages the user may never reach.
+function KamareImageViewer:_netLookaheadCap()
+    return NET_LOOKAHEAD_BY_TIER[self:_netTier()]
+end
+
+-- Adaptive total fetch timeout. On a healthy measured link we can afford to
+-- fail fast (a stall is real, hand off to retry); on an unknown/slow link keep
+-- it generous so a legit large page isn't aborted. Bounded to [15, 60]s.
+function KamareImageViewer:_fetchTimeoutSec()
+    local bw = self:_netBw()
+    if bw <= 0 then
+        return 60 -- unknown link: keep the historic default
+    end
+    local t = (4 * 1024 * 1024) / bw + 5
+    return math.min(60, math.max(15, math.floor(t)))
+end
+
+-- Core of the async page pipeline (shared by prefetch and the render path):
+-- make sure page `page` has a rendered tile set, fetching its image via the
+-- non-blocking client if needed. Dedups concurrent requests for the same page
+-- (_page_fetch_inflight) and remembers failures (_page_fetch_failed) so a
+-- broken page doesn't re-trigger on every paint. Transient failures (timeout,
+-- truncation, 5xx, connect/handshake errors) are retried with exponential
+-- backoff instead of permanently blacklisting the page. The retry budget
+-- depends on visibility: an OFF-SCREEN (prefetch) page gives up after
+-- NET_RETRY_MAX attempts; a VISIBLE page (render-path placeholder, or one that
+-- scrolled into view mid-fetch) keeps retrying until it succeeds, since giving
+-- up would leave the pending placeholder stuck on screen. Only 4xx responses
+-- (server definitively won't serve the page) and the off-screen retry budget
+-- being exhausted mark the page failed. `gen` is the generation token; stale
+-- results (chapter change / close) are discarded. `on_done()` is always called
+-- once (after the final outcome, including all retries).
+function KamareImageViewer:_ensurePageReady(page, gen, on_done, repaint)
+    on_done = on_done or function() end
+
+    if not self.virtual_document or gen ~= self._prefetch_gen then
+        on_done(); return
+    end
+    if self._page_fetch_failed[page] then
+        logger.dbg(string.format("[kamare:render] page=%d ensure skip (failed)", page))
+        on_done(); return
+    end
+    if self._page_fetch_inflight[page] then
+        logger.dbg(string.format("[kamare:render] page=%d ensure skip (inflight)", page))
+        -- Another caller is fetching this page. If we were asked to repaint
+        -- (render path / visible placeholder), remember that so the in-flight
+        -- fetch's completion triggers a setDirty even though *it* was started
+        -- by the prefetch chain with repaint=false. Otherwise the placeholder
+        -- stays on screen until the next user input.
+        if repaint then
+            self._pending_repaint_pages[page] = true
+        end
+        on_done(); return
     end
 
     local zoom = self:getCurrentZoom()
-    local rotation = self:_getRotationAngle()
-    local page_mode = (self.view_mode == 2) and "dual" or nil
-    local tiles_generated = self.virtual_document:prefetchPage(page_num, zoom, rotation, page_mode)
+    local pm   = (self.view_mode == 2) and "dual" or nil
 
-    return tiles_generated or 0
+    -- Body already injected -> just ensure tiles and done.
+    if self.virtual_document:isRawBodyReady(page) then
+        logger.dbg(string.format("[kamare:render] page=%d ensure skip (ready)", page))
+        local native_dims = self.virtual_document:getNativePageDimensions(page)
+        local rw, rh = self.canvas:_renderDimsFor(native_dims.w, native_dims.h)
+        self.virtual_document:prefetchPage(page, zoom, pm, rw, rh, self.canvas.render_quality)
+        on_done()
+        return
+    end
+
+    local chapter_id = self.metadata and (self.metadata.chapterId or self.metadata.chapter_id)
+    if not chapter_id then on_done(); return end
+    local page0 = math.max(0, page - 1)
+    local req, err = KavitaClient:buildImageRequestTable(chapter_id, page0)
+    if not req then
+        self._page_fetch_failed[page] = true
+        logger.dbg(string.format("[kamare:render] page=%d build-request FAIL: %s", page, tostring(err)))
+        on_done(); return
+    end
+
+    self._page_fetch_inflight[page] = true
+    self._page_fetch_retries[page] = 0
+    local t0 = time.now()
+
+    -- Terminal cleanup shared by every final outcome (success or give-up).
+    local function finish_terminal()
+        self._fetch_handles[page] = nil
+        self._page_fetch_inflight[page] = nil
+        self._page_fetch_retries[page] = nil
+    end
+
+    local do_fetch  -- forward decl (retry re-enters it)
+    do_fetch = function()
+        if gen ~= self._prefetch_gen or not self.virtual_document then
+            finish_terminal()
+            on_done(); return
+        end
+        local handle = AsyncFetch.fetch(req,
+            { quantum_ms = 60, total_timeout = self:_fetchTimeoutSec() },
+            function(body, code, stats)
+                if gen ~= self._prefetch_gen or not self.virtual_document then
+                    finish_terminal()
+                    on_done(); return
+                end
+                if body and code == 200 then
+                    self:_recordNetSample(true, stats and stats.throughput_Bps)
+                    finish_terminal()
+                    self.virtual_document:injectRawBody(page, body)
+                    local native_dims = self.virtual_document:getNativePageDimensions(page)
+                    local rw, rh = self.canvas:_renderDimsFor(native_dims.w, native_dims.h)
+                    local tiles = self.virtual_document:prefetchPage(page, zoom, pm,
+                                                                      rw, rh, self.canvas.render_quality)
+                    logger.dbg(string.format("[kamare:render] page=%d ready +%d tiles %dms",
+                        page, tonumber(tiles) or 0, time.to_ms(time.now() - t0)))
+                    -- Repaint ONLY for the render path (visible page with placeholder).
+                    -- Two ways to get here needing a repaint: this fetch was started by
+                    -- the render path (repaint=true), OR a later render-path call hit
+                    -- the in-flight short-circuit and flagged the pending set. Either
+                    -- way, fire one setDirty and clear the pending flag. Prefetch-only
+                    -- completions (off-screen pages) skip this to avoid e-ink flicker.
+                    local want_repaint = repaint or self._pending_repaint_pages[page]
+                    self._pending_repaint_pages[page] = nil
+                    if want_repaint and self.canvas and self.canvas.dimen then
+                        UIManager:setDirty(self, "partial", self.canvas.dimen)
+                    end
+                    on_done()
+                    return
+                end
+                -- Failure: transient (retry) vs permanent (give up). A flaky link
+                -- often produces a single timeout/truncation; retrying recovers the
+                -- page instead of blacklisting it until chapter reload.
+                self:_recordNetSample(false, stats and stats.throughput_Bps)
+                local attempts = self._page_fetch_retries[page] or 0
+                -- Visibility governs the retry cap. A page that is currently
+                -- on screen (render-path placeholder) must keep retrying until
+                -- it arrives; giving up leaves the "pending" placeholder stuck
+                -- and the document unreadable. Off-screen / prefetch pages
+                -- still respect NET_RETRY_MAX -- there's no point hammering a
+                -- server for a page the user may never see. Visibility is
+                -- re-checked here (not just the repaint flag captured at fetch
+                -- start) so a prefetch fetch whose page scrolled into view
+                -- during the backoff window is also upgraded to infinite retry.
+                local is_visible = repaint
+                    or (self._pending_repaint_pages[page])
+                if not is_visible then
+                    for _, vp in ipairs(self:_currentVisiblePages()) do
+                        if vp == page then is_visible = true; break end
+                    end
+                end
+                -- Give up only on a permanent 4xx (server won't serve it) or
+                -- when an OFF-SCREEN page has exhausted its retry budget.
+                local give_up = isPermanentFetchFailure(code)
+                    or (not is_visible and attempts >= NET_RETRY_MAX)
+                if not give_up then
+                    self._page_fetch_retries[page] = attempts + 1
+                    local backoff = NET_RETRY_BACKOFF_S[attempts + 1] or NET_RETRY_BACKOFF_S[#NET_RETRY_BACKOFF_S]
+                    local attempt_lbl = is_visible
+                        and tostring(attempts + 1)
+                        or string.format("%d/%d", attempts + 1, NET_RETRY_MAX)
+                    logger.dbg(string.format("[kamare:render] page=%d transient fail code=%s err=%s retry %s%s in %ds",
+                        page, tostring(code), (stats and stats.err) or "-", attempt_lbl,
+                        is_visible and " (visible)" or "", backoff))
+                    -- Keep _page_fetch_inflight set during the backoff window so the
+                    -- dedup short-circuit above suppresses duplicate fetches for the
+                    -- same page; the rescheduled do_fetch re-checks the gen token.
+                    UIManager:scheduleIn(backoff, function()
+                        if gen == self._prefetch_gen and self.virtual_document then
+                            do_fetch()
+                        else
+                            finish_terminal()
+                            on_done()
+                        end
+                    end)
+                    return
+                end
+                local why = isPermanentFetchFailure(code) and "" or " (retries exhausted)"
+                logger.dbg(string.format("[kamare:render] page=%d fetch FAIL code=%s err=%s%s",
+                    page, tostring(code), (stats and stats.err) or "-", why))
+                self._page_fetch_failed[page] = true
+                finish_terminal()
+                on_done()
+            end)
+        self._fetch_handles[page] = handle
+    end
+
+    do_fetch()
 end
 
-function KamareImageViewer:prefetchUpcomingTilesSynchronous()
+-- Render-path trigger: a page was painted as "pending" (cache miss). Request
+-- it async; on arrival the repaint above renders the real page.
+function KamareImageViewer:_onPendingRenderPage(page)
+    if not page or not self.virtual_document then return end
+    self:_ensurePageReady(page, self._prefetch_gen, nil, true) -- repaint: replace placeholder
+end
+
+-- Async prefetch chain: fetch one page, yield (tickAfterNext), re-evaluate
+-- position, and keep filling until calculateAdaptivePrefetch is satisfied.
+-- Because the fetch is non-blocking, this runs during active scroll without
+-- freezing it. Self-cancels when the gen token changes.
+function KamareImageViewer:_prefetchStepAsync()
+    if not self.virtual_document or self.prefetch_pages ~= 1 then
+        self._prefetch_chain_active = false
+        return
+    end
+    -- Refresh reader context each step: the chain re-enters here directly
+    -- (not via prefetchUpcomingTiles), so without this the eviction policy
+    -- would run on stale position and could evict the just-prefetched page.
+    self:_updateReaderContext()
+    local gen = self._prefetch_gen
+    local pages = self:calculateAdaptivePrefetch()
+    if #pages == 0 then
+        self._prefetch_chain_active = false
+        return
+    end
+    -- Anti-spin backstop: a healthy chain advances to a new page each step
+    -- (the previous page is now cached or skipped). If the same page is picked
+    -- twice in a row, progress isn't happening (stuck fetch / tilegen mismatch)
+    -- -- pause the chain instead of looping until crash. The next page-turn or
+    -- scroll event re-triggers it.
+    local page = pages[1]
+    -- Visible-page preemption: on a constrained link (or any recent errors),
+    -- don't start a speculative fetch while a visible page is still loading --
+    -- that page already fetches via the render path and should own the pipe.
+    -- Reschedule shortly instead of consuming the chain step.
+    if (self:_netBwFactor() < 1.0 or self:_netErrRate() > 0)
+       and self._page_fetch_inflight then
+        local visible_busy = false
+        for _, vp in ipairs(self:_currentVisiblePages()) do
+            if self._page_fetch_inflight[vp] then
+                visible_busy = true
+                break
+            end
+        end
+        if visible_busy then
+            logger.dbg(string.format(
+                "[kamare:prefetch] deferring speculative page=%d; visible page in flight (bw=%.0fKB/s err=%.0f%%)",
+                page, self:_netBw() / 1024, self:_netErrRate() * 100))
+            UIManager:scheduleIn(0.25, function()
+                if self._prefetch_gen == gen and self.virtual_document then
+                    self:_prefetchStepAsync()
+                else
+                    self._prefetch_chain_active = false
+                end
+            end)
+            return
+        end
+    end
+    if page == self._prefetch_last_pick then
+        logger.dbg(string.format("[kamare:prefetch] chain stuck on page %d; pausing chain", page))
+        self._prefetch_chain_active = false
+        self._prefetch_last_pick = nil
+        return
+    end
+    self._prefetch_last_pick = page
+    self:_ensurePageReady(page, gen, function()
+        if self._prefetch_gen ~= gen or not self.virtual_document then
+            self._prefetch_chain_active = false
+            return
+        end
+        -- Yield to UIManager between pages so input/paint keep flowing.
+        UIManager:tickAfterNext(function() self:_prefetchStepAsync() end)
+    end)
+end
+
+function KamareImageViewer:kickPrefetchChain()
     if not self.virtual_document then
         return
     end
-
-    local pages_to_prefetch = self:calculateAdaptivePrefetch()
-
-    if #pages_to_prefetch == 0 then
+    if self._prefetch_chain_active then
         return
     end
-
-    for _, page_num in ipairs(pages_to_prefetch) do
-        self:_prefetchPageSynchronous(page_num)
-    end
+    self._prefetch_chain_active = true
+    self._prefetch_last_pick = nil  -- fresh pass: allow re-attempt of a page a prior pass paused on
+    self:_prefetchStepAsync()
 end
 
 function KamareImageViewer:onSwipe(_, ges)
@@ -1641,14 +2333,9 @@ function KamareImageViewer:_canPanInPageMode(direction)
     if not dims or dims.w <= 0 or dims.h <= 0 then return false end
 
     local zoom = self:getCurrentZoom()
-    local rotation = self:_getRotationAngle()
 
     local page_w = dims.w
     local page_h = dims.h
-
-    if rotation % 180 ~= 0 then
-        page_w, page_h = page_h, page_w
-    end
 
     local scaled_w = page_w * zoom
     local scaled_h = page_h * zoom
@@ -1695,13 +2382,8 @@ function KamareImageViewer:_panWithinPage(direction)
     if not dims or dims.w <= 0 or dims.h <= 0 then return false end
 
     local zoom = self:getCurrentZoom()
-    local rotation = self:_getRotationAngle()
     local page_w = dims.w
     local page_h = dims.h
-
-    if rotation % 180 ~= 0 then
-        page_w, page_h = page_h, page_w
-    end
 
     local step_ratio = (self.scroll_distance or 25) / 100
 
@@ -1762,11 +2444,7 @@ function KamareImageViewer:_applyPagePosition(page, moving_forward)
     if not (dims and viewport_w > 0 and viewport_h > 0) then return end
 
     local zoom = self:getCurrentZoom()
-    local rotation = self:_getRotationAngle()
     local page_w, page_h = dims.w, dims.h
-    if rotation % 180 ~= 0 then
-        page_w, page_h = page_h, page_w
-    end
 
     if self.zoom_mode == 1 then
         local scaled_h = page_h * zoom
@@ -1789,6 +2467,28 @@ function KamareImageViewer:_applyPagePosition(page, moving_forward)
     end
 end
 
+function KamareImageViewer:_isPageCached(page)
+    if not (self.virtual_document and VIDCache) then
+        return true
+    end
+    page = Math.clamp(page or 1, 1, self._images_list_nb or 1)
+    -- Primary signal: the document's fully-cached set, kept accurate by
+    -- _preSplitPageTiles (marks on success) and the tile onFree callback
+    -- (clears on LRU eviction). Covers scroll-mode multi-tile pages.
+    if self.virtual_document:isPageFullyCached(page) then
+        return true
+    end
+    -- Fallback probe for page-mode pages rendered via renderPage (single
+    -- full-page tile, not tracked in _fully_cached_pages). Used by the
+    -- fetch indicator, where a false positive just suppresses one flash.
+    local zoom = self:getCurrentZoom()
+    local first_tile = Geom:new{ x = 0, y = 0, w = 1024, h = 1024 }
+    local hash = self.virtual_document:_tileHash(page, zoom,
+                                                  self.virtual_document.gamma, first_tile,
+                                                  self.canvas.render_quality)
+    return VIDCache:getNativeTile(hash) ~= nil
+end
+
 function KamareImageViewer:switchToImageNum(page)
     self:recordViewingTimeIfValid()
     page = Math.clamp(page, 1, self._images_list_nb)
@@ -1805,6 +2505,9 @@ function KamareImageViewer:switchToImageNum(page)
     self._reached_end = false
 
     local moving_forward = page > self._images_list_cur
+
+    logger.dbg(string.format("[kamare:viewer] turn %d -> %d (%s) mode=%d",
+        self._images_list_cur or -1, page, moving_forward and "fwd" or "back", self.view_mode))
 
     self._images_list_cur = page
     self.current_image_start_time = os.time()
@@ -1826,7 +2529,12 @@ function KamareImageViewer:switchToImageNum(page)
 
     self:updateImageOnly()
 
-    UIManager:setDirty(self, "partial", self.canvas.dimen)
+    -- Explicit page-turn in page/dual mode: flashpartial helps clear e-ink
+    -- ghosting from the previous page's artwork. Scroll-mode navigation
+    -- already set dirty via _scrollToPage -> _setScrollOffset with "partial";
+    -- keep "partial" there to avoid extra flashing on continuous scrolling.
+    local refresh_hint = (self.view_mode == 1) and "partial" or "flashpartial"
+    UIManager:setDirty(self, refresh_hint, self.canvas.dimen)
 
     self:updateFooter()
 
@@ -2028,7 +2736,7 @@ function KamareImageViewer:_checkAndOfferNextChapter()
     end)
 end
 
-function KamareImageViewer:_postViewProgress()
+function KamareImageViewer:_postViewProgress(force)
     if not self.metadata then return end
 
     local at_end = false
@@ -2063,11 +2771,62 @@ function KamareImageViewer:_postViewProgress()
 
     if self.last_posted_page == page_to_post and not (at_end or on_last_page) then return end
 
-    UIManager:nextTick(function()
+    -- Cancel any pending debounced POST.
+    if self._progress_post_func then
+        UIManager:unschedule(self._progress_post_func)
+        self._progress_post_func = nil
+    end
+
+    if force then
+        -- Immediate (sync) POST — used on close to ensure progress is saved.
+        -- Cancel any in-flight async POST first so it can't land after the
+        -- close POST and clobber the final position with an older page.
+        if self._progress_post_handle then
+            pcall(function() self._progress_post_handle.cancel() end)
+            self._progress_post_handle = nil
+        end
+        self._progress_post_inflight = false
+        self._progress_post_pending = false
         pcall(function()
             KavitaClient:postReaderProgressForPage(self.metadata, page_to_post)
         end)
-    end)
+    else
+        -- Debounced: accumulate page changes during fast scroll, fire once
+        -- 2s after the user stops. Dispatched via AsyncFetch so the HTTP
+        -- round-trip doesn't freeze the UI thread (~300ms typical).
+        -- Cooperative inflight guard: if the user keeps moving and a new
+        -- debounce fires while the prior POST is still in flight, the new
+        -- one defers to the prior POST's completion callback (which then
+        -- re-evaluates against the latest page) -- preventing two parallel
+        -- POSTs from landing out of order at the server.
+        local meta = self.metadata
+        local page = page_to_post
+        self._progress_post_func = function()
+            self._progress_post_func = nil
+            if self._progress_post_inflight then
+                -- Prior POST still running. Mark pending; the completion
+                -- callback will pick up the latest page when it lands.
+                self._progress_post_pending = true
+                return
+            end
+            self._progress_post_inflight = true
+            self._progress_post_handle = KavitaClient:postReaderProgressForPageAsync(
+                meta, page,
+                function(_, _code)
+                    self._progress_post_inflight = false
+                    self._progress_post_handle = nil
+                    if self._progress_post_pending then
+                        self._progress_post_pending = false
+                        -- Force re-evaluation against the latest page state.
+                        -- last_posted_page was advanced when we scheduled, so
+                        -- clear it to bypass the early-return dedup check.
+                        self.last_posted_page = nil
+                        self:_postViewProgress()
+                    end
+                end)
+        end
+        UIManager:scheduleIn(2.0, self._progress_post_func)
+    end
     self.last_posted_page = page_to_post
 end
 
@@ -2101,7 +2860,7 @@ function KamareImageViewer:onClose()
     end
 
     self:syncAndSaveSettings()
-    self:_postViewProgress()
+    self:_postViewProgress(true) -- force immediate (sync) POST on close
     self:recordViewingTimeIfValid()
 
     if self.initial_rotation_mode and Screen:getRotationMode() ~= self.initial_rotation_mode then
@@ -2129,6 +2888,39 @@ function KamareImageViewer:onClose()
 end
 
 function KamareImageViewer:onCloseWidget()
+    -- Release the singleton slot, but only if it still points at us.
+    if KamareImageViewer.active_instance == self then
+        KamareImageViewer.active_instance = nil
+    end
+
+    -- Cancel any pending coalesced footer refresh so the nextTick callback
+    -- can't fire on a freed footer.
+    if self._footer_update_func then
+        UIManager:unschedule(self._footer_update_func)
+        self._footer_update_pending = false
+    end
+
+    -- Cancel any pending debounced progress POST.
+    if self._progress_post_func then
+        UIManager:unschedule(self._progress_post_func)
+        self._progress_post_func = nil
+    end
+
+    -- Cancel any in-flight async fetches: bump the generation token (pending
+    -- callbacks become no-ops) and abort every live fetch handle (there can be
+    -- several: prefetch chain + render-path pending pages).
+    self._prefetch_gen = (self._prefetch_gen or 0) + 1
+    self._prefetch_chain_active = false
+    if self._fetch_handles then
+        for _page, handle in pairs(self._fetch_handles) do
+            if handle and handle.cancel then
+                pcall(function() handle.cancel() end)
+            end
+        end
+        self._fetch_handles = {}
+    end
+    self._pending_repaint_pages = {}
+
     if self.virtual_document then
         self.virtual_document:close()
         self.virtual_document = nil
@@ -2146,10 +2938,6 @@ function KamareImageViewer:onCloseWidget()
     UIManager:setDirty(nil, function()
         return "flashui", self.main_frame.dimen
     end)
-end
-
-function KamareImageViewer:_getRotationAngle()
-    return self.rotated and 90 or 0
 end
 
 function KamareImageViewer:onImageLoadError(pageno, error_msg)
@@ -2215,39 +3003,38 @@ function KamareImageViewer:handleRotation(mode, old_mode)
 
     if matching_orientation then
         UIManager:setDirty(self, "full")
-    else
-        -- Capture a page-anchored position (page index + within-page fraction)
-        -- so continuous mode lands at the same spot after the orientation flip.
-        local captured_anchor = nil
-        if self.view_mode == 1 and self.canvas and self.virtual_document then
-            local max_scroll = self.canvas:getMaxScrollOffset() or 0
-            local so = self.scroll_offset or 0
-            if max_scroll > 0 and so > 0 then
-                local rotation = self:_getRotationAngle()
-                local viewport_w = select(1, self.canvas:getViewportSize())
-                local zoom = self.canvas.zoom or self.current_zoom or 1.0
-                local total_pages = self._images_list_nb or 0
-                local page_at_top = self.virtual_document:getPageAtOffset(
-                    so, zoom, rotation, self.zoom_mode, viewport_w)
-                local page_start = self.virtual_document:getScrollPositionForPage(
-                    page_at_top, zoom, rotation, self.zoom_mode, viewport_w)
-                local next_start
-                if page_at_top >= total_pages then
-                    next_start = self.virtual_document:getVirtualHeight(
-                        zoom, rotation, self.zoom_mode, viewport_w)
-                else
-                    next_start = self.virtual_document:getScrollPositionForPage(
-                        page_at_top + 1, zoom, rotation, self.zoom_mode, viewport_w)
+        else
+            -- Capture a page-anchored position (page index + within-page fraction)
+            -- so continuous mode lands at the same spot after the orientation flip.
+            local captured_anchor = nil
+            if self.view_mode == 1 and self.canvas and self.virtual_document then
+                local max_scroll = self.canvas:getMaxScrollOffset() or 0
+                local so = self.scroll_offset or 0
+                if max_scroll > 0 and so > 0 then
+                    local viewport_w = select(1, self.canvas:getViewportSize())
+                    local zoom = self.canvas.zoom or self.current_zoom or 1.0
+                    local total_pages = self._images_list_nb or 0
+                    local page_at_top = self.virtual_document:getPageAtOffset(
+                        so, zoom, self.zoom_mode, viewport_w, self.page_gap_height)
+                    local page_start = self.virtual_document:getScrollPositionForPage(
+                        page_at_top, zoom, self.zoom_mode, viewport_w, self.page_gap_height)
+                    local next_start
+                    if page_at_top >= total_pages then
+                        next_start = self.virtual_document:getVirtualHeight(
+                            zoom, self.zoom_mode, viewport_w, self.page_gap_height)
+                    else
+                        next_start = self.virtual_document:getScrollPositionForPage(
+                            page_at_top + 1, zoom, self.zoom_mode, viewport_w, self.page_gap_height)
+                    end
+                    local page_h = next_start - page_start
+                    local frac = 0
+                    if page_h > 0 then
+                        frac = (so - page_start) / page_h
+                        if frac < 0 then frac = 0 elseif frac > 1 then frac = 1 end
+                    end
+                    captured_anchor = { page = page_at_top, frac = frac }
                 end
-                local page_h = next_start - page_start
-                local frac = 0
-                if page_h > 0 then
-                    frac = (so - page_start) / page_h
-                    if frac < 0 then frac = 0 elseif frac > 1 then frac = 1 end
-                end
-                captured_anchor = { page = page_at_top, frac = frac }
             end
-        end
 
         UIManager:setDirty(nil, "full")
         local new_screen_size = Screen:getSize()

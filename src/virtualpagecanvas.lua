@@ -1,9 +1,34 @@
+-- VirtualPageCanvas: owns all projection / viewing state.
+--
+-- Ownership contract:
+--   * The canvas stores viewport size, margins, gaps, zoom,
+--     zoom_mode, view_mode, current_page, scroll_offset, center ratios,
+--     render_quality, and the canvas-local _layout_dirty flag.
+--   * Layout queries delegate to the document's pure projection methods
+--     (getVirtualHeight etc.) with the canvas's current viewing state.
+--   * Render dims are computed here via _renderDimsFor(native_w, native_h)
+--     from render_quality + screen size; passed to drawPageTiled /
+--     _preSplitPageTiles as parameters.
+--
+-- Rotation: NOT tracked by the canvas. Visual rotation is delegated entirely
+-- to KOReader's screen-level framebuffer (`Screen:setRotationMode`). When
+-- the screen rotates, `Screen:getWidth/Height` swap, the viewer's
+-- `handleRotation` re-sizes the canvas, and the canvas re-fits to the new
+-- viewport. The plugin never rotates page pixels.
+--
+-- Coordinate-space naming convention (see virtualimagedocument.lua for the
+-- full table): `native_*`, `render_*`, `scaled_*`, `canvas_*`.
 local Widget = require("ui/widget/widget")
 local Geom = require("ui/geometry")
 local UIManager = require("ui/uimanager")
 local Blitbuffer = require("ffi/blitbuffer")
 local logger = require("logger")
 local Math = require("optmath")
+local time = require("ui/time")
+local Font = require("ui/font")
+local TextWidget = require("ui/widget/textwidget")
+local Device = require("device")
+local Screen = Device.screen
 
 local VirtualPageCanvas = Widget:extend{
     document = nil,
@@ -13,23 +38,32 @@ local VirtualPageCanvas = Widget:extend{
 
     zoom_mode = 0, -- 0: "full" | 1: "width" | 2: "height"
     zoom = 1.0,
-    rotation = 0,
+
+    -- Render-quality (prescale factor for image decoding). Owned by the
+    -- canvas because it depends on screen DPI/size, which are projection
+    -- concerns. -1 means "decode at native resolution".
+    render_quality = -1,
 
     center_x_ratio = 0.5,
     center_y_ratio = 0.5,
 
     scroll_offset = 0,
 
-    padding = 0,
-    horizontal_margin = 0,
+    h_margin = 0,
+    top_margin = 0,
+    bottom_margin = 0,
     background = Blitbuffer.COLOR_WHITE,
     page_gap_height = 8,
 
     page_direction = 0, -- 0: LTR, 1: RTL
     dual_page_gap = 5,
 
-    _virtual_height = 0,
     _layout_dirty = true,
+
+    -- Callback (set by the viewer) invoked when a page is painted as "pending"
+    -- (image not arrived yet): function(page_num). The viewer uses it to kick
+    -- off an async fetch and repaint on arrival.
+    on_pending_page = nil,
 }
 
 function VirtualPageCanvas:init()
@@ -110,11 +144,10 @@ function VirtualPageCanvas:setZoomMode(mode)
     end
 end
 
-function VirtualPageCanvas:setRotation(rotation)
-    rotation = rotation or 0
-    rotation = rotation % 360
-    if self.rotation ~= rotation then
-        self.rotation = rotation
+function VirtualPageCanvas:setRenderQuality(quality)
+    quality = tonumber(quality) or -1
+    if self.render_quality ~= quality then
+        self.render_quality = quality
         self._layout_dirty = true
         self:markDirty()
     end
@@ -161,23 +194,42 @@ function VirtualPageCanvas:setScrollOffset(offset)
     end
 end
 
-function VirtualPageCanvas:setPadding(padding)
-    padding = math.max(0, tonumber(padding) or 0)
+function VirtualPageCanvas:setHMargin(margin)
+    margin = math.max(0, tonumber(margin) or 0)
 
-    if padding ~= self.padding then
-        self.padding = padding
+    if margin ~= self.h_margin then
+        self.h_margin = margin
         self._layout_dirty = true
         self:markDirty()
     end
 end
 
-function VirtualPageCanvas:setHorizontalMargin(margin)
+function VirtualPageCanvas:setTopMargin(margin)
     margin = math.max(0, tonumber(margin) or 0)
 
-    if margin ~= self.horizontal_margin then
-        self.horizontal_margin = margin
-        if self.view_mode == 1 then
-            self._layout_dirty = true
+    if margin ~= self.top_margin then
+        self.top_margin = margin
+        self._layout_dirty = true
+        self:markDirty()
+    end
+end
+
+function VirtualPageCanvas:setBottomMargin(margin)
+    margin = math.max(0, tonumber(margin) or 0)
+
+    if margin ~= self.bottom_margin then
+        self.bottom_margin = margin
+        self._layout_dirty = true
+        self:markDirty()
+    end
+end
+
+function VirtualPageCanvas:setDualPageGap(gap)
+    gap = math.max(0, tonumber(gap) or 0)
+
+    if math.abs(gap - self.dual_page_gap) > 0.5 then
+        self.dual_page_gap = gap
+        if self.view_mode == 2 then
             self:markDirty()
         end
     end
@@ -193,7 +245,7 @@ end
 function VirtualPageCanvas:setPageGapHeight(gap)
     gap = math.max(0, tonumber(gap) or 0)
 
-    if math.abs(gap - (self.page_gap_height or 0)) > 0.5 then
+    if math.abs(gap - self.page_gap_height) > 0.5 then
         self.page_gap_height = gap
         if self.view_mode == 1 then
             self._layout_dirty = true
@@ -226,28 +278,21 @@ function VirtualPageCanvas:setSize(w, h)
 end
 
 function VirtualPageCanvas:getViewportSize()
-    local horizontal_spacing = self.padding
-
-    if self.view_mode == 1 then
-        horizontal_spacing = self.padding + (self.horizontal_margin or 0)
-    end
-
-    local w = math.floor(math.max(0, self.dimen.w - 2 * horizontal_spacing))
-    local h = math.floor(math.max(0, self.dimen.h - 2 * self.padding))
+    local w = math.floor(math.max(0, self.dimen.w - 2 * self.h_margin))
+    local h = math.floor(math.max(0, self.dimen.h - self.top_margin - self.bottom_margin))
 
     return w, h
 end
 
 function VirtualPageCanvas:getVirtualHeight()
-    if self.view_mode ~= 1 or not self.document then
+    if self.view_mode ~= 1 or not (self.document and self.document.is_open) then
         return 0
     end
-
     if self._layout_dirty then
         self:recalculateLayout()
     end
-
-    return self._virtual_height or 0
+    local viewport_w = select(1, self:getViewportSize())
+    return self.document:getVirtualHeight(self.zoom, self.zoom_mode, viewport_w, self.page_gap_height)
 end
 
 function VirtualPageCanvas:getMaxScrollOffset()
@@ -283,10 +328,6 @@ function VirtualPageCanvas:_computeZoomForPage(page)
     local page_w = dims.w
     local page_h = dims.h
 
-    if self.rotation % 180 ~= 0 then
-        page_w, page_h = page_h, page_w
-    end
-
     if page_w <= 0 or page_h <= 0 then
         return self.zoom
     end
@@ -303,7 +344,7 @@ function VirtualPageCanvas:_computeZoomForPage(page)
         result = math.min(zoom_w, zoom_h)
     end
 
-    -- Quantize zoom to integer pixels using the rotated page dimensions
+    -- Quantize zoom to integer pixels using the native page dimensions.
     if self.zoom_mode == 1 then -- width
         local scaled_w = math.floor(page_w * result + 0.5)
         result = scaled_w / page_w
@@ -323,25 +364,52 @@ function VirtualPageCanvas:_computeZoomForPage(page)
     return result
 end
 
+function VirtualPageCanvas:_maxNativePageWidth()
+    if not (self.document and self.document.is_open and self.document._dims_cache) then
+        return 0
+    end
+    local max_w = 0
+    for i = 1, self.document:getPageCount() do
+        local dims = self.document._dims_cache[i]
+        if dims and dims.w and dims.w > 0 then
+            if dims.w > max_w then max_w = dims.w end
+        end
+    end
+    return max_w
+end
+
+-- Compute render-space dimensions for a page from its native dimensions
+-- and the canvas's render_quality setting. Pure function; no cache.
+-- Returns (render_w, render_h) in render pixels.
+function VirtualPageCanvas:_renderDimsFor(native_w, native_h)
+    local render_w, render_h = native_w, native_h
+    if self.render_quality ~= -1 then
+        local screen_size = Screen:getSize()
+        -- Always use portrait width (smaller dimension) for consistent
+        -- prescale across orientations.
+        local portrait_w = math.min(screen_size.w, screen_size.h)
+        local cap_w = math.floor(portrait_w * self.render_quality)
+        if native_w > cap_w then
+            local scale = cap_w / native_w
+            render_w = math.floor(native_w * scale)
+            render_h = math.floor(native_h * scale)
+        end
+    end
+    return render_w, render_h
+end
+
 function VirtualPageCanvas:_ensureZoom()
     if self.view_mode == 1 and self.zoom_mode == 1 then
+        -- Scroll + fit-width: each page zooms to fit viewport_w; the canvas
+        -- zoom represents the widest page (used only for clamping/offset math).
         local viewport_w = select(1, self:getViewportSize())
-        if viewport_w > 0 and self.document and self.document.is_open and self.document._ensureVirtualLayout then
-            local entry
-            local ok, result = pcall(function()
-                return self.document:_ensureVirtualLayout(self.rotation or 0)
-            end)
-            if ok then
-                entry = result
-            else
-                logger.warn("VPC:_ensureZoom ensure layout failed:", result)
-            end
-            local target_width = entry and entry.rotated_max_width
-            if target_width and target_width > 0 then
+        if viewport_w > 0 and self.document and self.document.is_open then
+            local target_width = self:_maxNativePageWidth()
+            if target_width > 0 then
                 local computed = viewport_w / target_width
                 local scaled_w = math.floor(target_width * computed + 0.5)
                 computed = scaled_w / target_width
-                if computed > 0 and math.abs(computed - (self.zoom or 0)) > 1e-6 then
+                if computed > 0 and math.abs(computed - self.zoom) > 1e-6 then
                     self.zoom = computed
                     self._layout_dirty = true
                 end
@@ -356,37 +424,29 @@ function VirtualPageCanvas:_ensureZoom()
         self.zoom = computed
         self._layout_dirty = true
     end
+
+    -- In scroll mode, always cap page width by the indented viewport so that
+    -- `h_margin` produces a visible indent regardless of zoom_mode.
+    -- Without this cap, fit-height / fit-page modes can pick a zoom that
+    -- leaves the page wider than the viewport, causing the centering math at
+    -- paintScroll to algebraically cancel out the margin.
+    if self.view_mode == 1 then
+        local viewport_w = select(1, self:getViewportSize())
+        local max_w = self:_maxNativePageWidth()
+        if viewport_w > 0 and max_w > 0 then
+            local cap = viewport_w / max_w
+            if self.zoom > cap + 1e-9 then
+                self.zoom = cap
+                self._layout_dirty = true
+            end
+        end
+    end
 end
 
 function VirtualPageCanvas:recalculateLayout()
     self:_ensureZoom()
     self._layout_dirty = false
-    self._virtual_height = 0
-
-    if not self.document or not self.document.is_open then
-        return
-    end
-
-    if self.document.virtual_layout == nil or self.document.total_virtual_height == nil then
-        if self.document._calculateVirtualLayout then
-            self.document:_calculateVirtualLayout()
-        end
-    end
-
-    local viewport_w, viewport_h = self:getViewportSize()
-    if self.document.getVirtualHeight then
-        local total = self.document:getVirtualHeight(self.zoom, self.rotation, self.zoom_mode, viewport_w)
-        if total and total > 0 then
-            self._virtual_height = total
-        else
-            self._virtual_height = viewport_h
-        end
-    elseif self.document.total_virtual_height then
-        self._virtual_height = (self.document.total_virtual_height or 0) * self.zoom
-    else
-        self._virtual_height = viewport_h
-    end
-
+    if not (self.document and self.document.is_open) then return end
     self.scroll_offset = Math.clamp(self.scroll_offset or 0, 0, self:getMaxScrollOffset())
 end
 
@@ -397,6 +457,20 @@ function VirtualPageCanvas:markDirty()
 end
 
 function VirtualPageCanvas:paintTo(target, x, y)
+    -- xpcall (not pcall) so the traceback handler runs at the throw site
+    -- before the stack unwinds — gives a useful stack pointing at the bug
+    -- instead of just this frame. The pcall stays (a throw here would
+    -- propagate to UIManager and likely kill the reader); we just make the
+    -- failure loud instead of silently blanking the page.
+    local ok, err = xpcall(self._paintToImpl, function(e)
+        return debug.traceback(tostring(e), 2)
+    end, self, target, x, y)
+    if not ok then
+        logger.err("VPC:paintTo failed:", err)
+    end
+end
+
+function VirtualPageCanvas:_paintToImpl(target, x, y)
     if not self.dimen then return end
     local canvas_w = self.dimen.w
     local canvas_h = self.dimen.h
@@ -421,6 +495,25 @@ function VirtualPageCanvas:paintTo(target, x, y)
 end
 
 
+-- Glyph shown centered over a page region whose image hasn't arrived yet.
+local PLACEHOLDER_GLYPH = "⏳"
+
+-- Used by the render path when drawPageTiled reports a page as "pending".
+function VirtualPageCanvas:_paintPlaceholder(target, rx, ry, rw, rh)
+    if rw <= 0 or rh <= 0 then return end
+    if not self._placeholder_widget then
+        self._placeholder_widget = TextWidget:new{
+            text = PLACEHOLDER_GLYPH,
+            face = Font:getFace("ffont", 22),
+        }
+    end
+    local w = self._placeholder_widget
+    local size = w:getSize()
+    local px = rx + math.max(0, math.floor((rw - size.w) / 2))
+    local py = ry + math.max(0, math.floor((rh - size.h) / 2))
+    pcall(function() w:paintTo(target, px, py) end)
+end
+
 function VirtualPageCanvas:paintSinglePage(target, x, y)
     if not self.document then
         return
@@ -437,12 +530,10 @@ function VirtualPageCanvas:paintSinglePage(target, x, y)
         return
     end
 
-    local zoom = self.zoom or 1.0
+    local zoom = self.zoom
     if zoom <= 0 then zoom = 1.0 end
-    local rotation = self.rotation or 0
-    local page_size = self.document:transformRect(native_dims, zoom, rotation)
-    local scaled_w = page_size.w or 0
-    local scaled_h = page_size.h or 0
+    local scaled_w = native_dims.w * zoom
+    local scaled_h = native_dims.h * zoom
     if scaled_w <= 0 or scaled_h <= 0 then
         return
     end
@@ -464,59 +555,54 @@ function VirtualPageCanvas:paintSinglePage(target, x, y)
         w = view_w / zoom,
         h = view_h / zoom,
     }
-    rect.scaled_rect = Geom:new{
-        x = src_x,
-        y = src_y,
-        w = view_w,
-        h = view_h,
-    }
 
-    local dest_x = x + self.padding + math.floor((viewport_w - view_w) / 2)
-    local dest_y = y + self.padding + math.floor((viewport_h - view_h) / 2)
+    local dest_x = x + self.h_margin + math.floor((viewport_w - view_w) / 2)
+    local dest_y = y + self.top_margin + math.floor((viewport_h - view_h) / 2)
 
-    local ok_draw = pcall(function()
-        return self.document:drawPageTiled(target, dest_x, dest_y, rect, page, zoom, rotation, nil, 0, true)
+    local render_w, render_h = self:_renderDimsFor(native_dims.w, native_dims.h)
+    local ok_draw, r = pcall(function()
+        return self.document:drawPageTiled(target, dest_x, dest_y, rect, page, zoom,
+                                           nil, 0, true, render_w, render_h, self.render_quality)
     end)
     if not ok_draw then
         logger.warn("VPC:paintSinglePage tiled render failed")
+    elseif r == "pending" then
+        self:_paintPlaceholder(target, dest_x, dest_y, view_w, view_h)
+        if self.on_pending_page then self.on_pending_page(page) end
     end
 end
 
 function VirtualPageCanvas:getDualPagePair(current_page)
-    if not self.document then
+    if not self.document or not self.document._dual_page_pairs then
         return current_page, 0
     end
 
-    -- Pairs should already be built in document init
-    if not self.document._dual_page_pairs then
+    -- O(1) reverse-index lookup (built alongside _dual_page_pairs).
+    local idx = self.document._dual_page_pair_index
+                                and self.document._dual_page_pair_index[current_page]
+    if idx == nil then
         return current_page, 0
     end
 
-    local pairs = self.document._dual_page_pairs
-    for i, pair in ipairs(pairs) do
-        local page1, page2 = pair[1], pair[2]
+    local pair = self.document._dual_page_pairs[idx]
+    local page1, page2 = pair[1], pair[2]
 
-        if current_page == page1 or current_page == page2 then
-            if page1 == page2 and page1 > 0 then
-                return current_page, -1  -- Signal solo landscape display
-            end
-
-            -- Apply RTL flipping for display
-            -- page_direction: 0 = LTR, 1 = RTL
-            local left_page, right_page
-            if self.page_direction == 1 then
-                -- RTL: swap pages (right page comes first in reading order)
-                left_page, right_page = page2, page1
-            else
-                -- LTR: keep physical order
-                left_page, right_page = page1, page2
-            end
-
-            return left_page, right_page
-        end
+    if page1 == page2 and page1 > 0 then
+        return current_page, -1  -- Signal solo landscape display
     end
 
-    return current_page, 0
+    -- Apply RTL flipping for display
+    -- page_direction: 0 = LTR, 1 = RTL
+    local left_page, right_page
+    if self.page_direction == 1 then
+        -- RTL: swap pages (right page comes first in reading order)
+        left_page, right_page = page2, page1
+    else
+        -- LTR: keep physical order
+        left_page, right_page = page1, page2
+    end
+
+    return left_page, right_page
 end
 
 function VirtualPageCanvas:_computeZoomForDualPage(left_page, right_page, page_width, vp_h)
@@ -563,13 +649,13 @@ function VirtualPageCanvas:_getDualPageRect(page, zoom, side, page_width, vp_h, 
     local zoomed_w = dims.w * zoom
     local zoomed_h = dims.h * zoom
 
-    local x_offset = self.padding
+    local x_offset = self.h_margin
     if side == "right" then
         x_offset = x_offset + page_width + gap_offset
     end
 
     x_offset = x_offset + (page_width - zoomed_w) / 2
-    local y_offset = self.padding + (vp_h - zoomed_h) / 2
+    local y_offset = self.top_margin + (vp_h - zoomed_h) / 2
 
     return {
         x = x_offset,
@@ -604,8 +690,6 @@ function VirtualPageCanvas:paintDualPage(target, x, y)
     local zoom = self:_computeZoomForDualPage(left_page, right_page, page_width, viewport_h)
     if zoom <= 0 then zoom = 1.0 end
 
-    local rotation = self.rotation or 0
-
     if left_page > 0 and left_page <= page_count then
         local left_rect_info = self:_getDualPageRect(left_page, zoom, "left", page_width, viewport_h)
         if left_rect_info then
@@ -617,21 +701,20 @@ function VirtualPageCanvas:paintDualPage(target, x, y)
                     w = native_dims.w,
                     h = native_dims.h,
                 }
-                rect.scaled_rect = Geom:new{
-                    x = 0,
-                    y = 0,
-                    w = left_rect_info.w,
-                    h = left_rect_info.h,
-                }
 
                 local dest_x = x + math.floor(left_rect_info.x)
                 local dest_y = y + math.floor(left_rect_info.y)
 
-                local ok_draw = pcall(function()
-                    return self.document:drawPageTiled(target, dest_x, dest_y, rect, left_page, zoom, rotation, nil, 0, true)
+                local render_w, render_h = self:_renderDimsFor(native_dims.w, native_dims.h)
+                local ok_draw, r = pcall(function()
+                    return self.document:drawPageTiled(target, dest_x, dest_y, rect, left_page, zoom,
+                                                       nil, 0, true, render_w, render_h, self.render_quality)
                 end)
                 if not ok_draw then
                     logger.warn("VPC:paintDualPage left page tiled render failed")
+                elseif r == "pending" then
+                    self:_paintPlaceholder(target, dest_x, dest_y, left_rect_info.w, left_rect_info.h)
+                    if self.on_pending_page then self.on_pending_page(left_page) end
                 end
             end
         end
@@ -648,21 +731,20 @@ function VirtualPageCanvas:paintDualPage(target, x, y)
                     w = native_dims.w,
                     h = native_dims.h,
                 }
-                rect.scaled_rect = Geom:new{
-                    x = 0,
-                    y = 0,
-                    w = right_rect_info.w,
-                    h = right_rect_info.h,
-                }
 
                 local dest_x = x + math.floor(right_rect_info.x)
                 local dest_y = y + math.floor(right_rect_info.y)
 
-                local ok_draw = pcall(function()
-                    return self.document:drawPageTiled(target, dest_x, dest_y, rect, right_page, zoom, rotation, nil, 0, true)
+                local render_w, render_h = self:_renderDimsFor(native_dims.w, native_dims.h)
+                local ok_draw, r = pcall(function()
+                    return self.document:drawPageTiled(target, dest_x, dest_y, rect, right_page, zoom,
+                                                       nil, 0, true, render_w, render_h, self.render_quality)
                 end)
                 if not ok_draw then
                     logger.warn("VPC:paintDualPage right page tiled render failed")
+                elseif r == "pending" then
+                    self:_paintPlaceholder(target, dest_x, dest_y, right_rect_info.w, right_rect_info.h)
+                    if self.on_pending_page then self.on_pending_page(right_page) end
                 end
             end
         end
@@ -673,15 +755,10 @@ function VirtualPageCanvas:_prepareLayout()
     if self._layout_dirty then
         self:recalculateLayout()
     end
-    if not (self.document and self.document.virtual_layout) then
-        if self.document and self.document._calculateVirtualLayout then
-            self.document:_calculateVirtualLayout()
-        end
-    end
 end
 
-function VirtualPageCanvas:paintScroll(target, x, y, retry)
-    retry = retry or 0
+function VirtualPageCanvas:paintScroll(target, x, y)
+    local t0 = time.now()
 
     self:_ensureZoom()
     self:_prepareLayout()
@@ -692,11 +769,11 @@ function VirtualPageCanvas:paintScroll(target, x, y, retry)
     end
 
     local scroll_offset = Math.clamp(self.scroll_offset or 0, 0, self:getMaxScrollOffset())
-    local zoom = self.zoom or 1.0
+    local zoom = self.zoom
 
     local visible_pages = {}
     local ok, err = pcall(function()
-        visible_pages = self.document:getVisiblePagesAtOffset(scroll_offset, viewport_h, zoom, self.rotation, self.zoom_mode, viewport_w)
+        visible_pages = self.document:getVisiblePagesAtOffset(scroll_offset, viewport_h, zoom, self.zoom_mode, viewport_w, self.page_gap_height)
     end)
     if not ok then
         logger.warn("VPC:paintScroll getVisiblePagesAtOffset failed:", err)
@@ -707,32 +784,27 @@ function VirtualPageCanvas:paintScroll(target, x, y, retry)
         return
     end
 
-
-    local stacked_y = self.padding
-
-    if self.document and (self.document._virtual_layout_dirty or not self.document.virtual_layout) then
-        self._layout_dirty = true
-        if retry < 1 then
-            self:recalculateLayout()
-            return self:paintScroll(target, x, y, retry + 1)
-        else
-            self:markDirty()
-            return
-        end
+    local page_nums = {}
+    for _, p in ipairs(visible_pages) do
+        table.insert(page_nums, p.page_num)
     end
+    logger.dbg(string.format("[kamare:scroll] paint offset=%d vp=%dx%d zoom=%.3f pages=[%s]",
+        scroll_offset, viewport_w, viewport_h, zoom, table.concat(page_nums, ",")))
 
+    local stacked_y = self.top_margin
+    local bottom_limit = self.dimen.h - self.bottom_margin
 
-    local gap_px = math.floor((self.page_gap_height or 0) * zoom)
+    local gap_px = math.floor(self.page_gap_height)
     local prev_page
     for _, page_info in ipairs(visible_pages) do
         if prev_page and page_info.page_num ~= prev_page and gap_px > 0 then
-            local remain_gap = viewport_h - stacked_y
+            local remain_gap = bottom_limit - stacked_y
             if remain_gap <= 0 then break end
             local draw_gap = math.min(gap_px, remain_gap)
             stacked_y = stacked_y + draw_gap
         end
 
-        local remain = viewport_h - stacked_y
+        local remain = bottom_limit - stacked_y
         if remain <= 0 then break end
         local visible_h = page_info.visible_bottom - page_info.visible_top
         local slice_h_px = math.min(math.floor(visible_h), remain)
@@ -744,34 +816,39 @@ function VirtualPageCanvas:paintScroll(target, x, y, retry)
             local layout = page_info.layout
             local page_zoom = page_info.zoom or zoom
 
-            local scaled_w = math.floor((layout.rotated_width or layout.native_width) * page_zoom)
+            local scaled_w = math.floor(layout.native_width * page_zoom)
 
-            local horizontal_spacing = self.padding + (self.horizontal_margin or 0)
+            local horizontal_spacing = self.h_margin
             local dest_x = x + horizontal_spacing + math.floor((viewport_w - scaled_w) / 2)
             local dest_y = y + stacked_y
 
             local native_y = math.floor(top_px / page_zoom)
             local native_h = math.floor(slice_h_px / page_zoom)
 
-            local native_dims = Geom:new{ w = layout.native_width, h = layout.native_height }
-            local _, render_h = self.document:_calculateRenderDimensions(native_dims, false)
-            local render_scale_y = render_h / native_dims.h
-            local scaled_h = math.floor(native_h * render_scale_y)
-            local zoom_scale_y = page_zoom / render_scale_y
-            local actual_slice_h_px = math.floor(scaled_h * zoom_scale_y)
+            local native_dims_w = layout.native_width
+            local native_dims_h = layout.native_height
+            local render_w, render_h = self:_renderDimsFor(native_dims_w, native_dims_h)
+            -- Slice height in scaled space (must match getVisiblePagesAtOffset's
+            -- scaled-space accounting to avoid rounding drift).
+            local actual_slice_h_px = math.floor(native_h * page_zoom)
 
             local rect = Geom:new{
                 x = 0,
                 y = native_y,
-                w = layout.native_width,
+                w = native_dims_w,
                 h = native_h,
             }
 
-            local ok_draw = pcall(function()
-                return self.document:drawPageTiled(target, dest_x, dest_y, rect, page_info.page_num, page_zoom, self.rotation, nil, 1, false)
+            local ok_draw, r = pcall(function()
+                return self.document:drawPageTiled(target, dest_x, dest_y, rect, page_info.page_num, page_zoom,
+                                                    nil, 1, false,
+                                                    render_w, render_h, self.render_quality)
             end)
             if not ok_draw then
                 logger.warn("VPC:paintScroll tiled slice render failed", "page", page_info.page_num)
+            elseif r == "pending" then
+                self:_paintPlaceholder(target, dest_x, dest_y, scaled_w, actual_slice_h_px)
+                if self.on_pending_page then self.on_pending_page(page_info.page_num) end
             end
 
             stacked_y = stacked_y + actual_slice_h_px
@@ -779,6 +856,7 @@ function VirtualPageCanvas:paintScroll(target, x, y, retry)
         end
     end
 
+    logger.dbg(string.format("[kamare:scroll] paint done %dms", time.to_ms(time.now() - t0)))
 end
 
 function VirtualPageCanvas:onCloseWidget()

@@ -62,6 +62,9 @@ local MODE_INDEX = {
 
 local KamareFooter = {}
 KamareFooter.__index = KamareFooter
+-- Exposed so external callers (e.g. KamareImageViewer:getFooterState) can
+-- branch on the active mode without hardcoding numeric constants.
+KamareFooter.MODE = MODE
 
 function KamareFooter.new(_, opts)
     local self = setmetatable({}, KamareFooter)
@@ -298,11 +301,13 @@ function KamareFooter:updateProgressBar()
 
     if self.settings.disable_progress_bar then
         self.progress_bar:setPercentage(0)
+        self.progress_bar.alt = nil
         return
     end
 
     if not self.state or not self.state.has_document or (self.state.total_pages or 0) <= 1 then
         self.progress_bar:setPercentage(0)
+        self.progress_bar.alt = nil
         return
     end
 
@@ -320,31 +325,124 @@ function KamareFooter:updateProgressBar()
         progress = (self.state.current_page - 1) / (self.state.total_pages - 1)
     end
     self.progress_bar:setPercentage(progress or 0)
+
+    -- Overlay prefetched (fully-cached) page ranges as light-gray ticks. The
+    -- dark-gray current-position fill paints *over* these, so only the
+    -- read-ahead tail beyond the current page is actually visible. Gray is
+    -- intentional — green was tried first and found too visually distracting.
+    self.progress_bar.altcolor = Blitbuffer.COLOR_GRAY_E
+    self.progress_bar.alt = self:_buildCachedAlt(self.state)
+    -- Use total_pages-1 as the denominator so the alt positions align exactly
+    -- with the current-page percentage above ((page-1)/(total-1)).
+    self.progress_bar.last = (self.state.total_pages and self.state.total_pages > 1)
+        and (self.state.total_pages - 1) or nil
+end
+
+-- Build the ProgressWidget `alt` table ({{start, len}, ...}) from the cached
+-- page set. Returns nil when there's nothing to mark so paintTo skips the
+-- alt path entirely (its default).
+function KamareFooter:_buildCachedAlt(state)
+    if not state or not state.cached_pages or not state.total_pages
+       or state.total_pages <= 1 then
+        return nil
+    end
+    local cached = state.cached_pages
+    if not next(cached) then return nil end
+
+    -- Iterate only up to total_pages - 1: progress_bar.last is total_pages - 1
+    -- (to match the (page-1)/(total-1) indicator convention), and progresswidget
+    -- scales each run's width by len/last. Including page total_pages would let a
+    -- run's width exceed fill_width and spill past the bar's right edge.
+    local alt = {}
+    local run_start, run_len = nil, 0
+    for p = 1, state.total_pages - 1 do
+        if cached[p] then
+            if not run_start then
+                run_start = p
+                run_len = 1
+            else
+                run_len = run_len + 1
+            end
+        elseif run_start then
+            alt[#alt + 1] = { run_start, run_len }
+            run_start, run_len = nil, 0
+        end
+    end
+    if run_start then
+        alt[#alt + 1] = { run_start, run_len }
+    end
+    return alt[1] and alt or nil
+end
+
+-- Cheap change-signal for the cached-pages set: count of marked pages plus
+-- the highest page number currently marked. Two snapshots differing in either
+-- field mean the prefetch state changed and the progress bar needs a repaint.
+-- O(n) over the cached set, called once per footer update.
+function KamareFooter:_cachedFingerprint(cached)
+    if not cached then return 0 end
+    local count, maxp = 0, 0
+    for p, v in pairs(cached) do
+        if v then
+            count = count + 1
+            if p > maxp then maxp = p end
+        end
+    end
+    return count * 100000 + maxp
 end
 
 function KamareFooter:update(state)
     if not self:isVisible() then return false end
 
-    -- Check if state actually changed
-    local changed = false
-    if not self.state or
-       self.state.current_page ~= state.current_page or
-       self.state.total_pages ~= state.total_pages or
-       self.state.scroll_progress ~= state.scroll_progress or
-       self.state.time_estimate ~= state.time_estimate or
-       self.state.is_scroll_mode ~= state.is_scroll_mode or
-       self.state.is_rtl_mode ~= state.is_rtl_mode or
-       self.state.has_document ~= state.has_document then
-        changed = true
+    -- Split dirty detection into "text-affecting" and "progress-bar-affecting"
+    -- change sets. scroll_progress only impacts the progress bar, so a
+    -- within-page scroll no longer pays for updateContent (text re-layout).
+    local prev = self.state
+    local text_changed, progress_changed
+
+    if not prev then
+        text_changed = true
+        progress_changed = true
+    else
+        if prev.current_page ~= state.current_page
+           or prev.total_pages ~= state.total_pages
+           or prev.has_document ~= state.has_document
+           or prev.time_estimate ~= state.time_estimate then
+            text_changed = true
+        end
+        -- Fields that affect the progress bar widget. (current_page and
+        -- total_pages overlap with text_changed; that's fine.)
+        if prev.current_page ~= state.current_page
+           or prev.total_pages ~= state.total_pages
+           or prev.has_document ~= state.has_document
+           or prev.is_scroll_mode ~= state.is_scroll_mode
+           or prev.is_rtl_mode ~= state.is_rtl_mode
+           or prev.scroll_progress ~= state.scroll_progress then
+            progress_changed = true
+        end
+        -- cached_pages is the live _fully_cached_pages table from the
+        -- document; it's mutated in place as prefetch lands / tiles evict,
+        -- so a reference compare won't catch changes. Use a count + last-marked
+        -- fingerprint -- enough to flag new prefetch progress between user
+        -- actions. Always (re)compute so the stored snapshot stays current
+        -- even when progress_changed was already set by another field.
+        local cur_fp = self:_cachedFingerprint(state.cached_pages)
+        if self._prev_cached_fp ~= cur_fp then
+            progress_changed = true
+        end
+        self._prev_cached_fp = cur_fp
     end
 
-    if changed then
+    if text_changed or progress_changed then
         self.state = state
-        self:updateContent()
-        self:updateProgressBar()
+        if text_changed then
+            self:updateContent()
+        end
+        if progress_changed then
+            self:updateProgressBar()
+        end
     end
 
-    return changed
+    return text_changed or progress_changed
 end
 
 function KamareFooter:free()

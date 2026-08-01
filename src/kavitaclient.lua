@@ -9,6 +9,8 @@ local socketutil = require("socketutil")
 local url = require("socket.url")
 local rapidjson = require("rapidjson")
 local md5 = require("ffi/sha2").md5
+local AsyncFetch = require("kamareasyncfetch")
+local time = require("ui/time")
 
 local ApiCache = Cache:new{
     slots = 20,
@@ -235,9 +237,48 @@ function KavitaClient:apiJSONCached(path, opts, ttl, ns)
     return data, code, headers, status, body
 end
 
--- Generic API request with Authorization: Bearer
+-- Generic API request entry point. Wraps _apiRequestImpl with timing and
+-- error logging; re-raises (level 2, blaming the caller) on failure.
 -- Returns: code, headers, status, body_string
 function KavitaClient:apiRequest(path, opts)
+    local t0 = time.now()
+    local ok, code, headers, status, body = pcall(KavitaClient._apiRequestImpl, self, path, opts)
+    local elapsed_ms = time.to_ms(time.now() - t0)
+    local method = (opts and opts.method) or "GET"
+    if not ok then
+        -- on error, `code` holds the error message
+        logger.dbg(string.format("[kamare:fetch] FAIL %s %s %dms: %s", method, path, elapsed_ms, tostring(code)))
+        error(code, 2)
+    end
+    local body_len = (type(body) == "string") and #body or 0
+    logger.dbg(string.format("[kamare:fetch] %s %s code=%s bytes=%d %dms",
+        method, path, tostring(code), body_len, elapsed_ms))
+    return code, headers, status, body
+end
+
+-- Build the common request headers (Accept, Accept-Encoding, device, client)
+-- and add the active auth credential (x-api-key or Authorization: Bearer).
+-- `accept` sets the Accept header value. Returns (headers) on success, or
+-- (nil, err) when no authentication is configured.
+function KavitaClient:_buildAuthHeaders(accept)
+    local headers = {
+        ["Accept"] = accept,
+        ["Accept-Encoding"] = "identity",
+        ["X-Device-Id"] = self.device_id,
+        ["X-Kavita-Client"] = self:_generateClientInfoHeader(),
+    }
+    if self.auth_method == "apiKey" and self.api_key and self.api_key ~= "" then
+        headers["x-api-key"] = self.api_key
+    elseif self.bearer and self.bearer ~= "" then
+        headers["Authorization"] = "Bearer " .. self.bearer
+    else
+        return nil, "No authentication available"
+    end
+    return headers
+end
+
+-- Generic API request with Authorization: Bearer / x-api-key.
+function KavitaClient:_apiRequestImpl(path, opts)
     opts = opts or {}
     local method = opts.method or "GET"
     local query = opts.query
@@ -269,21 +310,11 @@ function KavitaClient:apiRequest(path, opts)
     local qs = self:_buildQueryString(query)
     full_url = full_url .. qs
 
-    local headers = {
-        ["Accept"] = accept_format == "json" and "application/json" or "text/plain",
-        ["Accept-Encoding"] = "identity",
-        ["X-Device-Id"] = self.device_id,
-        ["X-Kavita-Client"] = self:_generateClientInfoHeader(),
-    }
-
-    -- Set authentication header based on method
-    if self.auth_method == "apiKey" and self.api_key and self.api_key ~= "" then
-        headers["x-api-key"] = self.api_key
-    elseif self.bearer and self.bearer ~= "" then
-        headers["Authorization"] = "Bearer " .. self.bearer
-    else
-        logger.warn("KavitaClient:apiRequest: no authentication available")
-        return -1, nil, "No authentication available", nil
+    local headers, auth_err = self:_buildAuthHeaders(
+        accept_format == "json" and "application/json" or "text/plain")
+    if not headers then
+        logger.warn("KavitaClient:apiRequest: " .. auth_err)
+        return -1, nil, auth_err, nil
     end
 
     local source
@@ -504,6 +535,44 @@ function KavitaClient:getStreamSeries(name, params)
     return data, code, headers, status, body_str
 end
 
+-- Fetch the user's reading lists (paginated): POST /api/ReadingList/lists
+-- params: { PageNumber, PageSize, includePromoted?, sortByLastModified? }
+-- Returns: array_of_ReadingListDto, code, headers, status, raw_body
+function KavitaClient:getReadingLists(params)
+    local query = {}
+    if type(params) == "table" then
+        query.PageNumber = params.PageNumber or params.pageNumber or params.page or 1
+        query.PageSize   = params.PageSize   or params.pageSize   or params.page_size or 50
+        if params.includePromoted ~= nil then
+            query.includePromoted = params.includePromoted and "true" or "false"
+        end
+        if params.sortByLastModified ~= nil then
+            query.sortByLastModified = params.sortByLastModified and "true" or "false"
+        end
+    end
+
+    local data, code, headers, status, body = self:apiJSONCached("/api/ReadingList/lists", {
+        method = "POST",
+        query  = query,
+    }, 120, "kavita|reading-lists")
+    return data, code, headers, status, body
+end
+
+-- Fetch all items (chapters) of a reading list: GET /api/ReadingList/items?readingListId={id}
+-- Note: server flags this call as expensive.
+-- Returns: array_of_ReadingListItemDto, code, headers, status, raw_body
+function KavitaClient:getReadingListItems(readingListId)
+    if readingListId == nil then
+        logger.warn("KavitaClient:getReadingListItems: readingListId is required")
+        return nil, nil, nil, "readingListId required", nil
+    end
+    local data, code, headers, status, body = self:apiJSONCached("/api/ReadingList/items", {
+        method = "GET",
+        query  = { readingListId = readingListId },
+    }, 60, "kavita|reading-list-items")
+    return data, code, headers, status, body
+end
+
 -- Fetch SeriesDetailDto: GET /api/Series/series-detail?seriesId={id}
 -- Returns: seriesDetailDto_tbl, code, headers, status, raw_body
 function KavitaClient:getSeriesDetail(seriesId)
@@ -541,45 +610,46 @@ function KavitaClient:getFileDimensions(chapter_id)
     return data, code, headers, status, body
 end
 
--- Creates a page table for Kavita Reader images
-function KavitaClient:createReaderPageTable(chapter_id, ctx)
-    local page_table = { image_disposable = true }
+-- Build a complete socket.http-style request table for a Reader /image fetch.
+-- Auth + base headers come from the shared _buildAuthHeaders helper (same as
+-- _apiRequestImpl), so the async non-blocking fetch client issues an
+-- identical request. Returns {url, method, headers} (caller supplies sink).
+function KavitaClient:buildImageRequestTable(chapter_id, page0)
+    if not self.base_url then
+        return nil, "Missing base_url"
+    end
+    local query = {
+        chapterId  = chapter_id,
+        page       = page0,
+        extractPdf = "false",
+    }
+    -- Some deployments require apiKey as a query param in addition to Bearer
+    if self.api_key and self.api_key ~= "" then
+        query.apiKey = self.api_key
+    end
 
-    setmetatable(page_table, { __index = function(_, key)
-        if type(key) ~= "number" then
-            return nil
-        end
-        -- Our page_table is 1-based (Lua). Kavita Reader /image uses 0-based page index.
-        local page1 = key
-        local page0 = math.max(0, (page1 or 1) - 1)
+    local base = self.base_url:gsub("/+$", "")
+    local full_url = base .. "/api/Reader/image" .. self:_buildQueryString(query)
 
-        -- Build query
-        local query = {
-            chapterId  = chapter_id,
-            page       = page0,
-            extractPdf = "false",
-        }
-        -- Some deployments require apiKey as query param in addition to Bearer
-        if self.api_key and self.api_key ~= "" then
-            query.apiKey = self.api_key
-        end
+    local headers, auth_err = self:_buildAuthHeaders("*/*")
+    if not headers then
+        return nil, auth_err
+    end
 
-        local code, _, _, body_str = self:apiRequest("/api/Reader/image", {
-            method  = "GET",
-            query   = query,
-            headers = { ["Accept"] = "*/*" },
-            timeout_profile = "file",
-        })
+    return {
+        url = full_url,
+        method = "GET",
+        headers = headers,
+    }
+end
 
-        if type(code) ~= "number" or code ~= 200 then
-            return nil
-        end
-
-        -- No reading progress side-effects here; handled by viewer when page is shown
-        return body_str
-    end })
-
-    return page_table
+-- Creates a page table for Kavita Reader images.
+-- Page images are fetched on demand by the async non-blocking client
+-- (kamareasyncfetch.lua); the page count is supplied separately by the viewer
+-- via VirtualImageDocument's pages_override, so this table is now just a
+-- metadata carrier (no lazy per-page supplier).
+function KavitaClient:createReaderPageTable(_chapter_id, _ctx)
+    return { image_disposable = true }
 end
 
 -- Convenience wrapper to return page table
@@ -620,6 +690,63 @@ function KavitaClient:postReaderProgressForPage(ctx, pageNum)
         libraryId = ctx.library_id or ctx.libraryId,
     }
     return self:postReaderProgress(payload)
+end
+
+-- Async equivalent of postReaderProgressForPage. Runs the POST through the
+-- non-blocking AsyncFetch client so UIManager keeps processing input/paint
+-- during the round-trip (the sync version blocks ~300ms). Used for the
+-- debounced progress post during active reading; the close path stays sync
+-- to guarantee delivery before teardown.
+--
+-- on_done(body, code) is invoked once on completion (success or failure).
+-- Errors are logged but not raised; callers must not depend on the POST
+-- succeeding for correctness (progress is best-effort).
+function KavitaClient:postReaderProgressForPageAsync(ctx, pageNum, on_done)
+    on_done = on_done or function() end
+    if type(ctx) ~= "table" or type(pageNum) ~= "number" then
+        logger.warn("KavitaClient:postReaderProgressForPageAsync: invalid ctx or pageNum")
+        on_done(nil, -1)
+        return
+    end
+    if not self.base_url then
+        logger.warn("KavitaClient:postReaderProgressForPageAsync: missing base_url")
+        on_done(nil, -1)
+        return
+    end
+
+    local payload = {
+        volumeId  = ctx.volume_id or ctx.volumeId,
+        chapterId = ctx.chapter_id or ctx.chapterId,
+        pageNum   = pageNum,
+        seriesId  = ctx.series_id or ctx.seriesId,
+        libraryId = ctx.library_id or ctx.libraryId,
+    }
+    local body = rapidjson.encode(payload)
+
+    local base = self.base_url:gsub("/+$", "")
+    local headers, auth_err = self:_buildAuthHeaders("application/json")
+    if not headers then
+        logger.warn("KavitaClient:postReaderProgressForPageAsync: " .. auth_err)
+        on_done(nil, -1)
+        return
+    end
+    headers["Content-Type"] = "application/json"
+
+    local req = {
+        url     = base .. "/api/Reader/progress",
+        method  = "POST",
+        headers = headers,
+        body    = body,
+    }
+    return AsyncFetch.fetch(req, { quantum_ms = 60 }, function(resp_body, code, stats)
+        if code == 200 then
+            logger.dbg(string.format("[kamare:progress] async POST ok page=%d", pageNum))
+        else
+            logger.dbg(string.format("[kamare:progress] async POST code=%s err=%s page=%d",
+                tostring(code), stats and stats.err or "-", pageNum))
+        end
+        on_done(resp_body, code)
+    end)
 end
 
 -- Search: GET /api/Search/search

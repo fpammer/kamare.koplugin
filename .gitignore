@@ -1,1 +1,5 @@
 .idea
+
+# Local KOReader bookinfo cache (generated, do not commit)
+src/bookinfo_cache.sqlite3
+*.sqlite3
