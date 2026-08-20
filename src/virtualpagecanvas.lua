@@ -457,16 +457,9 @@ function VirtualPageCanvas:markDirty()
 end
 
 function VirtualPageCanvas:paintTo(target, x, y)
-    -- xpcall (not pcall) so the traceback handler runs at the throw site
-    -- before the stack unwinds — gives a useful stack pointing at the bug
-    -- instead of just this frame. The pcall stays (a throw here would
-    -- propagate to UIManager and likely kill the reader); we just make the
-    -- failure loud instead of silently blanking the page.
-    local ok, err = xpcall(self._paintToImpl, function(e)
-        return debug.traceback(tostring(e), 2)
-    end, self, target, x, y)
+    local ok, err = pcall(self._paintToImpl, self, target, x, y)
     if not ok then
-        logger.err("VPC:paintTo failed:", err)
+        logger.warn("VPC:paintTo failed:", err)
     end
 end
 
