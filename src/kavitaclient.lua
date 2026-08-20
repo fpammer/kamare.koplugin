@@ -16,6 +16,27 @@ local ApiCache = Cache:new{
     slots = 20,
 }
 
+-- Zero-data stall budgets, in seconds. LuaSocket's block timeout only fires
+-- when *no* byte arrives for that long (it resets on every received chunk), so
+-- these bound dead-air time, not total transfer time.
+-- KOReader's LARGE profile (10s) makes a post-idle first-packet loss block the
+-- UI for 10-15s before failing; on a healthy link every endpoint here answers
+-- within ~0.5-2s, so 5s of silence means the connection is dead. apiRequest
+-- then retries transparently (see RETRY below), which succeeds immediately
+-- once the radio has woken up.
+local JSON_BLOCK_TIMEOUT = 5  -- was socketutil.LARGE_BLOCK_TIMEOUT (10)
+local JSON_TOTAL_TIMEOUT = 30
+-- Streams (on-deck, smart filters) can be genuinely slow server-side.
+local FILE_BLOCK_TIMEOUT = 10 -- was socketutil.FILE_BLOCK_TIMEOUT (15)
+local FILE_TOTAL_TIMEOUT = 60
+
+-- On Kobo, the first request after a network idle gap (>~10s) frequently gets
+-- zero bytes through for 10-35s (Wi-Fi power-save / AP buffering drops the
+-- initial packets; observed TCP handshakes taking 32s), while an immediate
+-- retry succeeds in ~300ms. Retry such stalls at the transport layer so every
+-- endpoint benefits, instead of per-endpoint retry loops.
+local TIMEOUT_RETRIES = 2
+
 local KavitaClient = {
     device_id = nil,
     client_info_header = nil,
@@ -237,14 +258,26 @@ function KavitaClient:apiJSONCached(path, opts, ttl, ns)
     return data, code, headers, status, body
 end
 
--- Generic API request entry point. Wraps _apiRequestImpl with timing and
--- error logging; re-raises (level 2, blaming the caller) on failure.
+-- Generic API request with Authorization: Bearer / x-api-key.
 -- Returns: code, headers, status, body_string
+-- Retries up to TIMEOUT_RETRIES extra times when a request dies with no data
+-- received ("timeout"): the classic post-idle first-packet loss, where the
+-- immediate retry succeeds.
 function KavitaClient:apiRequest(path, opts)
+    opts = opts or {}
+    local method = opts.method or "GET"
     local t0 = time.now()
-    local ok, code, headers, status, body = pcall(KavitaClient._apiRequestImpl, self, path, opts)
+    local ok, code, headers, status, body
+    for attempt = 1, TIMEOUT_RETRIES + 1 do
+        ok, code, headers, status, body = pcall(KavitaClient._apiRequestImpl, self, path, opts)
+        if not ok then break end
+        if code ~= "timeout" then break end
+        if attempt <= TIMEOUT_RETRIES then
+            logger.warn(string.format("[kamare:fetch] %s %s timed out with no data (attempt %d/%d), retrying",
+                method, path, attempt, TIMEOUT_RETRIES + 1))
+        end
+    end
     local elapsed_ms = time.to_ms(time.now() - t0)
-    local method = (opts and opts.method) or "GET"
     if not ok then
         -- on error, `code` holds the error message
         logger.dbg(string.format("[kamare:fetch] FAIL %s %s %dms: %s", method, path, elapsed_ms, tostring(code)))
@@ -277,7 +310,6 @@ function KavitaClient:_buildAuthHeaders(accept)
     return headers
 end
 
--- Generic API request with Authorization: Bearer / x-api-key.
 function KavitaClient:_apiRequestImpl(path, opts)
     opts = opts or {}
     local method = opts.method or "GET"
@@ -337,11 +369,11 @@ function KavitaClient:_apiRequestImpl(path, opts)
     local tt = opts.total_timeout
     if not bt or not tt then
         if opts.timeout_profile == "file" then
-            bt = socketutil.FILE_BLOCK_TIMEOUT
-            tt = socketutil.FILE_TOTAL_TIMEOUT
+            bt = FILE_BLOCK_TIMEOUT
+            tt = FILE_TOTAL_TIMEOUT
         else
-            bt = socketutil.LARGE_BLOCK_TIMEOUT
-            tt = socketutil.LARGE_TOTAL_TIMEOUT
+            bt = JSON_BLOCK_TIMEOUT
+            tt = JSON_TOTAL_TIMEOUT
         end
     end
     socketutil:set_timeout(bt, tt)
@@ -526,10 +558,13 @@ function KavitaClient:getStreamSeries(name, params)
         return nil, -1, nil, "unknown stream name", nil
     end
 
+    -- Streams (on-deck especially) can be slow server-side, hence the file
+    -- timeout profile. Post-idle stall retries are handled by apiRequest.
     local data, code, headers, status, body_str = self:apiJSONCached(path, {
         method = method,
         query  = query,
         body   = body,
+        timeout_profile = "file",
     }, 120, "kavita|stream")
 
     return data, code, headers, status, body_str
@@ -612,8 +647,8 @@ end
 
 -- Build a complete socket.http-style request table for a Reader /image fetch.
 -- Auth + base headers come from the shared _buildAuthHeaders helper (same as
--- _apiRequestImpl), so the async non-blocking fetch client issues an
--- identical request. Returns {url, method, headers} (caller supplies sink).
+-- _apiRequestImpl), so the async non-blocking fetch client issues an identical
+-- request. Returns {url, method, headers} (caller supplies sink).
 function KavitaClient:buildImageRequestTable(chapter_id, page0)
     if not self.base_url then
         return nil, "Missing base_url"
