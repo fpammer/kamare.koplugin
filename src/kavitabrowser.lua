@@ -503,7 +503,7 @@ function KavitaBrowser:buildKavitaVolumeItems(volumes)
             local name = Utils.buildVolumeTitle(v)
             local read = v.pagesRead
             local total = v.pages
-            local subtitle = (total and read) and (tostring(read) .. "/" .. tostring(total) .. " " .. _("pages")) or nil
+            local subtitle = (total and read) and (tostring(read) .. "/" .. tostring(total) .. " pages") or nil
             local mandatory = progress_icon(read, total)
             local item = {
                 text = name,
@@ -539,7 +539,7 @@ function KavitaBrowser:buildKavitaChapterItems(chapters, kind)
             local total = c.pages
             local subtitle
             if total and read then
-                subtitle = tostring(read) .. "/" .. tostring(total) .. " " .. _("pages")
+                subtitle = tostring(read) .. "/" .. tostring(total) .. " pages"
             end
 
             local mandatory = progress_icon(read, total)
@@ -674,6 +674,7 @@ function KavitaBrowser:showKavitaStream(stream_name, stream_type, stream_title, 
 
     -- Fetch all pages until we get less than page_size results or empty results
     local all_data = {}
+    local seen_series_ids = {}
     local page_num = 1
     local page_size = 50
     local has_more = true
@@ -696,14 +697,27 @@ function KavitaBrowser:showKavitaStream(stream_name, stream_type, stream_title, 
             return
         end
 
-        -- Append results to all_data
+        -- Dedup by series id; some Kavita builds ignore the paging params
         if type(data) == "table" and #data > 0 then
+            local new_count = 0
             for _, item in ipairs(data) do
-                table.insert(all_data, item)
+                local id = type(item) == "table" and item.id
+                if id ~= nil then
+                    if not seen_series_ids[id] then
+                        seen_series_ids[id] = true
+                        table.insert(all_data, item)
+                        new_count = new_count + 1
+                    end
+                else
+                    table.insert(all_data, item)
+                    new_count = new_count + 1
+                end
             end
 
             -- Check if we should continue fetching
-            if #data < page_size then
+            if new_count == 0 then
+                has_more = false
+            elseif #data < page_size then
                 has_more = false
             elseif max_pages and page_num >= max_pages then
                 has_more = false  -- Reached max page limit
@@ -916,7 +930,7 @@ function KavitaBrowser:buildKavitaReadingListItemItems(rli_items)
             local read  = rli.pagesRead or 0
             local subtitle
             if pages and pages > 0 then
-                subtitle = tostring(read) .. "/" .. tostring(pages) .. " " .. _("pages")
+                subtitle = tostring(read) .. "/" .. tostring(pages) .. " pages"
             end
             local mandatory = progress_icon(read, pages)
 
@@ -1163,6 +1177,7 @@ function KavitaBrowser:authenticateAfterSelection(server_name, server_url)
 
     -- Keep client api_key for endpoints that require it as query param
     KavitaClient.api_key = apiKey
+    KavitaClient.base_url = base_url
 
     -- Check if we should use API key authentication (version >= 0.8.9.0)
     local should_use_api_key = self:shouldUseApiKeyAuth(server_name, server_url)
@@ -1170,7 +1185,6 @@ function KavitaBrowser:authenticateAfterSelection(server_name, server_url)
     if should_use_api_key then
         -- New method: Just use API key, skip bearer token request
         KavitaClient.auth_method = "apiKey"
-        KavitaClient.base_url = base_url  -- Set base URL for API requests
         logger.info("Using API key authentication for server:", server_name)
     else
         -- Old method: Request bearer token
@@ -1525,7 +1539,7 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
                     return
                 end
 
-                local detail, _ = KavitaClient:getSeriesDetail(sid)
+                local detail = KavitaClient:getSeriesDetail(sid)
                 UIManager:close(next_loading)
 
                 if not detail then
@@ -1888,7 +1902,7 @@ function KavitaBrowser:onMenuHold(item)
                         UIManager:show(loading)
                         UIManager:forceRePaint()
 
-                        local chapter, _ = KavitaClient:getContinuePoint(sid)
+                        local chapter = KavitaClient:getContinuePoint(sid)
 
                         UIManager:close(loading)
 
