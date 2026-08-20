@@ -1578,6 +1578,12 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
         end,
     }
 
+    if viewer._aborted then
+        logger.dbg("KavitaBrowser: KamareImageViewer init aborted (duplicate), discarding")
+        UIManager:close(loading)
+        return
+    end
+
     -- Do initial prefetch
     if viewer and viewer.virtual_document then
         viewer:prefetchUpcomingTiles()

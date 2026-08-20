@@ -173,6 +173,7 @@ KamareImageViewer.active_instance = nil
 function KamareImageViewer:init()
     if KamareImageViewer.active_instance then
         logger.warn("KamareImageViewer: instance already active, refusing duplicate")
+        self._aborted = true
         return
     end
 
