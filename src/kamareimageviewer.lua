@@ -179,8 +179,6 @@ function KamareImageViewer:init()
 
     self:loadSettings()
 
-    self._page_turns_since_open = 0
-
     if self.override_view_mode ~= nil then
         local override_mode = self.override_view_mode
         self.view_mode = override_mode
@@ -1800,27 +1798,9 @@ function KamareImageViewer:calculateAdaptivePrefetch()
     local budget_after_active = budget_bytes - active_bytes
     if budget_after_active < 0 then budget_after_active = 0 end
 
-    -- Page-mode ramp-up: throttles prefetch depth for the first few page
-    -- turns to avoid spending RAM aggressively when the user might navigate
-    -- away. Scroll mode uses the full budget (chunked async fetch is
-    -- non-blocking, so there's no UI-freeze cost to aggressive prefetch).
-    local target_bytes
-    if self.view_mode == 1 then
-        target_bytes = budget_after_active
-    else
-        local page_turns = self._page_turns_since_open or 0
-        local ramp_fraction
-        if     page_turns <= 2  then ramp_fraction = 0.10
-        elseif page_turns <= 5  then ramp_fraction = 0.25
-        elseif page_turns <= 10 then ramp_fraction = 0.50
-        elseif page_turns <= 15 then ramp_fraction = 0.75
-        else                          ramp_fraction = 1.00 end
-        target_bytes = math.floor(budget_after_active * ramp_fraction)
-    end
-
     -- Shrink the prefetch byte budget on slow/flaky links (bw_factor). The
     -- floor (NET_BW_FACTOR_FLOOR) still allows warming the immediate next page.
-    target_bytes = math.floor(target_bytes * bw_factor)
+    local target_bytes = math.floor(budget_after_active * bw_factor)
 
     -- Contiguous fully-cached run starting from next_page. The buffer must
     -- stay contiguous; the first gap stops the run.
@@ -2151,7 +2131,7 @@ function KamareImageViewer:_ensurePageReady(page, gen, on_done, repaint)
                 -- start) so a prefetch fetch whose page scrolled into view
                 -- during the backoff window is also upgraded to infinite retry.
                 local is_visible = repaint
-                    or (self._pending_repaint_pages[page])
+                    or self._pending_repaint_pages[page]
                 if not is_visible then
                     for _, vp in ipairs(self:_currentVisiblePages()) do
                         if vp == page then is_visible = true; break end
@@ -2277,7 +2257,7 @@ function KamareImageViewer:kickPrefetchChain()
         return
     end
     if self._prefetch_chain_active then
-        return
+        return  -- a chain is already filling the buffer
     end
     self._prefetch_chain_active = true
     self._prefetch_last_pick = nil  -- fresh pass: allow re-attempt of a page a prior pass paused on
@@ -2512,10 +2492,6 @@ function KamareImageViewer:switchToImageNum(page)
 
     self._images_list_cur = page
     self.current_image_start_time = os.time()
-
-    if moving_forward then
-        self._page_turns_since_open = (self._page_turns_since_open or 0) + 1
-    end
 
     if self.ui and self.ui.statistics then
         self.ui.statistics:onPageUpdate(page)
