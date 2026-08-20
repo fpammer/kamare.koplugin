@@ -213,8 +213,7 @@ local KamareOptions = {
                 default_value = 1.0,
                 event = "SetContrast",
                 args = {0.8, 1.0, 1.5, 2.0, 4.0, 6.0, 10.0, 50.0},
-                name_text_hold_callback = optionsutil.showValues,
-                name_text_unit = true,
+                labels = {0.8, 1.0, 1.5, 2.0, 4.0, 6.0, 10.0, 50.0},
                 more_options = true,
                 more_options_param = {
                     value_step = 0.1, value_hold_step = 1,
@@ -232,8 +231,7 @@ local KamareOptions = {
                 default_value = 1.0,
                 event = "SetColorBoost",
                 args = {0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0},
-                name_text_hold_callback = optionsutil.showValues,
-                name_text_unit = true,
+                labels = {0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0, 6.0},
                 more_options = true,
                 more_options_param = {
                     value_step = 0.1, value_hold_step = 0.5,
