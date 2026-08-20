@@ -113,26 +113,28 @@ function Kamare:addToMainMenu(menu_items)
 end
 
 function Kamare:onShowKavitaBrowser()
-    self.browser = KavitaBrowser:new{
-        ui = self.ui,
-        servers = self.servers,
-        title = _("Kavita Manga Reader"),
-        is_popout = false,
-        is_borderless = true,
-        title_bar_fm_style = true,
-        kamare_settings = self.kamare_settings,
-        -- Pass CoverBrowser modules if available
-        has_coverbrowser = self.has_coverbrowser,
-        BookInfoManager = self.BookInfoManager,
-        CoverMenu = self.CoverMenu,
-        ListMenu = self.ListMenu,
-        MosaicMenu = self.MosaicMenu,
-        close_callback = function()
-            UIManager:close(self.browser)
-        end,
-    }
+    NetworkMgr:runWhenConnected(function()
+        self.browser = KavitaBrowser:new{
+            ui = self.ui,
+            servers = self.servers,
+            title = _("Kavita Manga Reader"),
+            is_popout = false,
+            is_borderless = true,
+            title_bar_fm_style = true,
+            kamare_settings = self.kamare_settings,
+            -- Pass CoverBrowser modules if available
+            has_coverbrowser = self.has_coverbrowser,
+            BookInfoManager = self.BookInfoManager,
+            CoverMenu = self.CoverMenu,
+            ListMenu = self.ListMenu,
+            MosaicMenu = self.MosaicMenu,
+            close_callback = function()
+                UIManager:close(self.browser)
+            end,
+        }
 
-    UIManager:show(self.browser)
+        UIManager:show(self.browser)
+    end)
 end
 
 function Kamare:getSettings()
