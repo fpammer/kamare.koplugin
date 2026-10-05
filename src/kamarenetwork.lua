@@ -11,45 +11,83 @@ function Network.new()
     local self = setmetatable({ active = true }, Network)
     if Device:isPocketBook() then
         local ok, inkview = pcall(require, "ffi/inkview")
-        if ok then self.inkview = inkview end
+        if ok then
+            self.inkview = inkview
+        end
     end
     self.tick = function()
-        if not self.active or self.suspended then return end
+        if not self.active or self.suspended then
+            return
+        end
         if self.inkview and NetworkMgr:isWifiOn() then
-            pcall(function() self.inkview.NetMgrPing() end)
+            pcall(function()
+                self.inkview.NetMgrPing()
+            end)
         end
         UIManager:scheduleIn(30, self.tick)
     end
-    self.tick()
+    if self.inkview then
+        self.tick()
+    end
     return self
 end
 
 -- Called by requests, not the keepalive timer: an idle viewer must not
 -- reconnect behind the user's back. Rate-limit reconnects across all pages.
 function Network:ready()
-    if not self.active or self.suspended then return false end
-    if NetworkMgr:isConnected() then return true end
+    if not self.active or self.suspended then
+        return false
+    end
+    -- Preserve existing connection handling on platforms not tested here.
+    if not self.inkview then
+        return true
+    end
+    if NetworkMgr:isConnected() then
+        return true
+    end
     local now = time.to_s(time.now())
     if not self.last_reconnect or now - self.last_reconnect >= 30 then
         self.last_reconnect = now
         logger.info("Kamare: restoring connection for pending page")
-        local ok = pcall(function() NetworkMgr:turnOnWifi() end)
-        if not ok then logger.warn("Kamare: reconnect failed") end
+        -- PocketBook NetConnect is synchronous; bound its frequency and do
+        -- not extend this platform-specific behavior to Kobo/Kindle.
+        local ok = pcall(function()
+            NetworkMgr:turnOnWifi()
+        end)
+        if not ok then
+            logger.warn("Kamare: reconnect failed")
+        end
     end
     return NetworkMgr:isConnected()
 end
 
 function Network:onFailure(err)
-    if not self.active or self.suspended or not self.inkview then return end
+    if not self.active or self.suspended or not self.inkview then
+        return
+    end
     -- PocketBook's libc may retain resolver configuration across reconnects.
-    if not tostring(err):lower():find("name resolution", 1, true) then return end
+    if not tostring(err):lower():find("name resolution", 1, true) then
+        return
+    end
     local now = time.to_s(time.now())
-    if self.last_dns_reset and now - self.last_dns_reset < 30 then return end
+    if self.last_dns_reset and now - self.last_dns_reset < 30 then
+        return
+    end
     self.last_dns_reset = now
     local ffi = require("ffi")
-    local ok = pcall(function() ffi.C.res_init() end)
-    if not ok then pcall(function() ffi.C.__res_init() end) end
-    logger.info("Kamare: refreshing resolver after DNS failure")
+    local ok, result = pcall(function()
+        return ffi.C.res_init()
+    end)
+    if not ok then
+        ok, result = pcall(function()
+            return ffi.C.__res_init()
+        end)
+    end
+    if ok and result == 0 then
+        logger.info("Kamare: refreshed resolver after DNS failure")
+    else
+        logger.warn("Kamare: resolver refresh unavailable or failed")
+    end
 end
 
 function Network:suspend()
@@ -58,11 +96,15 @@ function Network:suspend()
 end
 
 function Network:resume()
-    if not self.active then return end
+    if not self.active then
+        return
+    end
     self.suspended = false
     self.last_reconnect = nil
     UIManager:unschedule(self.tick)
-    self.tick()
+    if self.inkview then
+        self.tick()
+    end
 end
 
 function Network:close()

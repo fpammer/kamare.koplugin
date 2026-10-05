@@ -7,13 +7,15 @@ luajit tests/network_recovery.lua
 ```
 
 The suite loads the actual network helper, viewer methods, and client request
-builder with simulated KOReader UI, PocketBook APIs, clock, and HTTP callbacks.
+builder and actual document metadata methods with simulated KOReader UI, PocketBook APIs, clock, and HTTP callbacks.
 It does not need a device, server, credentials, or network access.
 
 It covers already-connected Wi-Fi keepalive, reconnect throttling, resolver
 refresh, suspend/resume, metadata retry and page numbering, authorization
 failure, callbacks after close, visible-page retry, exhausted prefetch recovery,
 HTTP 429, offline gating, cancellation, and both authentication request headers.
+It also checks capped metadata backoff, platform isolation, immutable metadata
+normalization, invalid/partial metadata, and real document layout rebuilding.
 
 These tests validate state transitions, not the device driver or live network.
 For device validation, start KOReader with Wi-Fi already enabled, read a remote

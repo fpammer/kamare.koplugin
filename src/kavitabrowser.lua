@@ -1477,23 +1477,7 @@ function KavitaBrowser:launchKavitaChapterViewer(chapter, series_name, is_volume
     do
         local dims, code = KavitaClient:getFileDimensions(chapter.id)
         if type(code) == "number" and code >= 200 and code < 300 and type(dims) == "table" then
-            -- Convert possible 0-based page indices to 1-based for the viewer
-            local zero_based = false
-            for _, d in ipairs(dims) do
-                local pn = d.pageNumber or d.page or d.page_num
-                if type(pn) == "number" and pn == 0 then
-                    zero_based = true
-                    break
-                end
-            end
-            if zero_based then
-                for _, d in ipairs(dims) do
-                    if type(d.pageNumber) == "number" then d.pageNumber = d.pageNumber + 1 end
-                    if type(d.page) == "number" then d.page = d.page + 1 end
-                    if type(d.page_num) == "number" then d.page_num = d.page_num + 1 end
-                end
-            end
-            preloaded_dimensions = dims
+            preloaded_dimensions = Utils.normalizePageDimensions(dims)
         else
             logger.warn("KavitaBrowser: getFileDimensions failed:", code)
         end

@@ -624,6 +624,27 @@ function VirtualImageDocument:preloadDimensions(list)
     end
 end
 
+-- Commit only a complete normalized set, so partial responses cannot leave
+-- dimensions and render/layout caches describing different geometries.
+function VirtualImageDocument:restoreDimensions(list)
+    local by_page = {}
+    for _, item in ipairs(list) do
+        if item.pageNumber >= 1 and item.pageNumber <= self._pages then
+            by_page[item.pageNumber] = item
+        end
+    end
+    for page = 1, self._pages do
+        if not by_page[page] then return false end
+    end
+    self:preloadDimensions(list)
+    self._dual_page_offset = nil
+    self._dual_page_pairs = nil
+    self._dual_page_pair_index = nil
+    self:_buildDualPageLayout()
+    self:clearCache()
+    return true
+end
+
 function VirtualImageDocument:validateDims(pageno)
     if pageno < 1 or pageno > self._pages then return end
     self._dims_cache = self._dims_cache or {}
