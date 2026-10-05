@@ -645,6 +645,19 @@ function KavitaClient:getFileDimensions(chapter_id)
     return data, code, headers, status, body
 end
 
+-- Same credentials as the normal metadata request, for asynchronous recovery.
+function KavitaClient:buildDimensionsRequestTable(chapter_id)
+    if not self.base_url then return nil, "Missing base_url" end
+    local headers, err = self:_buildAuthHeaders("application/json")
+    if not headers then return nil, err end
+    local query = { chapterId = chapter_id, extractPdf = "false" }
+    if self.api_key and self.api_key ~= "" then query.apiKey = self.api_key end
+    return {
+        url = self.base_url:gsub("/+$", "") .. "/api/Reader/file-dimensions" .. self:_buildQueryString(query),
+        method = "GET", headers = headers,
+    }
+end
+
 -- Build a complete socket.http-style request table for a Reader /image fetch.
 -- Auth + base headers come from the shared _buildAuthHeaders helper (same as
 -- _apiRequestImpl), so the async non-blocking fetch client issues an identical

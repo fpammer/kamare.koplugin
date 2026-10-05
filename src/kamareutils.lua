@@ -75,4 +75,32 @@ function Utils.resolveTitle(metadata, fallback_title, default)
     return fallback_title or default
 end
 
+-- Normalize server numbering once, without mutating a cached API response.
+function Utils.normalizePageDimensions(list)
+    if type(list) ~= "table" then return {} end
+    local zero_based = false
+    for _, item in ipairs(list) do
+        if type(item) == "table" and (item.pageNumber or item.page or item.page_num) == 0 then
+            zero_based = true
+            break
+        end
+    end
+    local result = {}
+    for _, item in ipairs(list) do
+        if type(item) == "table" then
+            local page = item.pageNumber or item.page or item.page_num
+            local w, h = item.width, item.height
+            if type(page) == "number" and page == math.floor(page)
+                and type(w) == "number" and w > 0 and w < math.huge
+                and type(h) == "number" and h > 0 and h < math.huge then
+                page = page + (zero_based and 1 or 0)
+                if page >= 1 and page < math.huge then
+                    result[#result + 1] = { pageNumber = page, width = w, height = h, isWide = item.isWide }
+                end
+            end
+        end
+    end
+    return result
+end
+
 return Utils

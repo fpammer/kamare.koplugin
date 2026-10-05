@@ -26,6 +26,8 @@ local Math = require("optmath")
 local ButtonDialog = require("ui/widget/buttondialog")
 local VIDCache = require("virtualimagedocumentcache")
 local AsyncFetch = require("kamareasyncfetch")
+local KamareNetwork = require("kamarenetwork")
+local rapidjson = require("rapidjson")
 local InfoMessage = require("ui/widget/infomessage")
 local FFIUtil = require("ffi/util")
 local _ = require("gettext")
@@ -65,7 +67,8 @@ local EVICT_BEHIND_KEEP   = 2
 -- (timeouts, truncation, connect/handshake/send errors, 5xx, empty body) is
 -- transient on a flaky link and worth retrying with backoff.
 local function isPermanentFetchFailure(code)
-    if code and code >= 400 and code < 500 then
+    if type(code) == "number" and code >= 400 and code < 500
+        and code ~= 408 and code ~= 429 then
         return true
     end
     return false
@@ -253,6 +256,9 @@ function KamareImageViewer:init()
             settings = self.footer_settings,
         }
     end
+
+    self._network = KamareNetwork.new()
+    self:_recoverDimensions()
 
     KamareImageViewer.active_instance = self
 
@@ -2007,6 +2013,65 @@ function KamareImageViewer:_fetchTimeoutSec()
     return math.min(60, math.max(15, math.floor(t)))
 end
 
+-- Metadata can fail independently of image downloads. Retry asynchronously
+-- within this viewer's lifetime; never keep rendering a chapter with stale
+-- fallback dimensions just because its opening request lost DNS.
+function KamareImageViewer:_recoverDimensions()
+    local doc = self.virtual_document
+    if not doc or doc:_hasCompleteDimensions() or self._dimensions_pending then return end
+    local chapter = self.metadata and (self.metadata.chapterId or self.metadata.chapter_id)
+    if not chapter then return end
+    local req = KavitaClient:buildDimensionsRequestTable(chapter)
+    if not req then return end
+    local gen = self._prefetch_gen
+    self._dimensions_pending = true
+    local function retry()
+        self._dimensions_pending = false
+        if self.virtual_document ~= doc or self._prefetch_gen ~= gen then return end
+        self._dimensions_attempts = math.min((self._dimensions_attempts or 0) + 1, 5)
+        local delay = math.min(60, 5 * 2 ^ (self._dimensions_attempts - 1))
+        self._dimensions_retry = function()
+            self._dimensions_retry = nil
+            self:_recoverDimensions()
+        end
+        UIManager:scheduleIn(delay, self._dimensions_retry)
+    end
+    if self._network and not self._network:ready() then retry(); return end
+    local handle = AsyncFetch.fetch(req, { total_timeout = 30 }, function(body, code, stats)
+        self._dimensions_handle = nil
+        if self.virtual_document ~= doc or self._prefetch_gen ~= gen then return end
+        local ok, dims = false, nil
+        if body and code == 200 then ok, dims = pcall(rapidjson.decode, body) end
+        if ok and type(dims) == "table" then
+            if doc:restoreDimensions(Utils.normalizePageDimensions(dims)) then
+                self._dimensions_pending = false
+                self._dimensions_attempts = 0
+                if self.canvas then self.canvas._layout_dirty = true end
+                if self.view_mode == 1 then self._pending_scroll_page = self._images_list_cur end
+                logger.info("Kamare: page dimensions recovered")
+                self:update()
+                return
+            end
+        end
+        if self._network then self._network:onFailure(stats and stats.err) end
+        if isPermanentFetchFailure(code) then
+            self._dimensions_pending = false
+            logger.warn("Kamare: metadata recovery rejected, HTTP", code)
+            return
+        end
+        retry()
+    end)
+    if self._dimensions_pending then self._dimensions_handle = handle end
+end
+
+function KamareImageViewer:onSuspend()
+    if self._network then self._network:suspend() end
+end
+
+function KamareImageViewer:onResume()
+    if self._network then self._network:resume() end
+end
+
 -- Core of the async page pipeline (shared by prefetch and the render path):
 -- make sure page `page` has a rendered tile set, fetching its image via the
 -- non-blocking client if needed. Dedups concurrent requests for the same page
@@ -2027,6 +2092,9 @@ function KamareImageViewer:_ensurePageReady(page, gen, on_done, repaint)
 
     if not self.virtual_document or gen ~= self._prefetch_gen then
         on_done(); return
+    end
+    if repaint and self._page_fetch_failed[page] == "transient" then
+        self._page_fetch_failed[page] = nil
     end
     if self._page_fetch_failed[page] then
         logger.dbg(string.format("[kamare:render] page=%d ensure skip (failed)", page))
@@ -2085,92 +2153,98 @@ function KamareImageViewer:_ensurePageReady(page, gen, on_done, repaint)
             finish_terminal()
             on_done(); return
         end
-        local handle = AsyncFetch.fetch(req,
-            { quantum_ms = 60, total_timeout = self:_fetchTimeoutSec() },
-            function(body, code, stats)
-                if gen ~= self._prefetch_gen or not self.virtual_document then
-                    finish_terminal()
-                    on_done(); return
-                end
-                if body and code == 200 then
-                    self:_recordNetSample(true, stats and stats.throughput_Bps)
-                    finish_terminal()
-                    self.virtual_document:injectRawBody(page, body)
-                    local native_dims = self.virtual_document:getNativePageDimensions(page)
-                    local rw, rh = self.canvas:_renderDimsFor(native_dims.w, native_dims.h)
-                    local tiles = self.virtual_document:prefetchPage(page, zoom, pm,
-                                                                      rw, rh, self.canvas.render_quality)
-                    logger.dbg(string.format("[kamare:render] page=%d ready +%d tiles %dms",
-                        page, tonumber(tiles) or 0, time.to_ms(time.now() - t0)))
-                    -- Repaint ONLY for the render path (visible page with placeholder).
-                    -- Two ways to get here needing a repaint: this fetch was started by
-                    -- the render path (repaint=true), OR a later render-path call hit
-                    -- the in-flight short-circuit and flagged the pending set. Either
-                    -- way, fire one setDirty and clear the pending flag. Prefetch-only
-                    -- completions (off-screen pages) skip this to avoid e-ink flicker.
-                    local want_repaint = repaint or self._pending_repaint_pages[page]
-                    self._pending_repaint_pages[page] = nil
-                    if want_repaint and self.canvas and self.canvas.dimen then
-                        UIManager:setDirty(self, "partial", self.canvas.dimen)
-                    end
-                    on_done()
-                    return
-                end
-                -- Failure: transient (retry) vs permanent (give up). A flaky link
-                -- often produces a single timeout/truncation; retrying recovers the
-                -- page instead of blacklisting it until chapter reload.
-                self:_recordNetSample(false, stats and stats.throughput_Bps)
-                local attempts = self._page_fetch_retries[page] or 0
-                -- Visibility governs the retry cap. A page that is currently
-                -- on screen (render-path placeholder) must keep retrying until
-                -- it arrives; giving up leaves the "pending" placeholder stuck
-                -- and the document unreadable. Off-screen / prefetch pages
-                -- still respect NET_RETRY_MAX -- there's no point hammering a
-                -- server for a page the user may never see. Visibility is
-                -- re-checked here (not just the repaint flag captured at fetch
-                -- start) so a prefetch fetch whose page scrolled into view
-                -- during the backoff window is also upgraded to infinite retry.
-                local is_visible = repaint
-                    or self._pending_repaint_pages[page]
-                if not is_visible then
-                    for _, vp in ipairs(self:_currentVisiblePages()) do
-                        if vp == page then is_visible = true; break end
-                    end
-                end
-                -- Give up only on a permanent 4xx (server won't serve it) or
-                -- when an OFF-SCREEN page has exhausted its retry budget.
-                local give_up = isPermanentFetchFailure(code)
-                    or (not is_visible and attempts >= NET_RETRY_MAX)
-                if not give_up then
-                    self._page_fetch_retries[page] = attempts + 1
-                    local backoff = NET_RETRY_BACKOFF_S[attempts + 1] or NET_RETRY_BACKOFF_S[#NET_RETRY_BACKOFF_S]
-                    local attempt_lbl = is_visible
-                        and tostring(attempts + 1)
-                        or string.format("%d/%d", attempts + 1, NET_RETRY_MAX)
-                    logger.dbg(string.format("[kamare:render] page=%d transient fail code=%s err=%s retry %s%s in %ds",
-                        page, tostring(code), (stats and stats.err) or "-", attempt_lbl,
-                        is_visible and " (visible)" or "", backoff))
-                    -- Keep _page_fetch_inflight set during the backoff window so the
-                    -- dedup short-circuit above suppresses duplicate fetches for the
-                    -- same page; the rescheduled do_fetch re-checks the gen token.
-                    UIManager:scheduleIn(backoff, function()
-                        if gen == self._prefetch_gen and self.virtual_document then
-                            do_fetch()
-                        else
-                            finish_terminal()
-                            on_done()
-                        end
-                    end)
-                    return
-                end
-                local why = isPermanentFetchFailure(code) and "" or " (retries exhausted)"
-                logger.dbg(string.format("[kamare:render] page=%d fetch FAIL code=%s err=%s%s",
-                    page, tostring(code), (stats and stats.err) or "-", why))
-                self._page_fetch_failed[page] = true
+        local function completed(body, code, stats)
+            if gen ~= self._prefetch_gen or not self.virtual_document then
                 finish_terminal()
+                on_done(); return
+            end
+            if body and code == 200 then
+                self:_recordNetSample(true, stats and stats.throughput_Bps)
+                finish_terminal()
+                self.virtual_document:injectRawBody(page, body)
+                local native_dims = self.virtual_document:getNativePageDimensions(page)
+                local rw, rh = self.canvas:_renderDimsFor(native_dims.w, native_dims.h)
+                local tiles = self.virtual_document:prefetchPage(page, zoom, pm,
+                                                                  rw, rh, self.canvas.render_quality)
+                logger.dbg(string.format("[kamare:render] page=%d ready +%d tiles %dms",
+                    page, tonumber(tiles) or 0, time.to_ms(time.now() - t0)))
+                -- Repaint ONLY for the render path (visible page with placeholder).
+                -- Two ways to get here needing a repaint: this fetch was started by
+                -- the render path (repaint=true), OR a later render-path call hit
+                -- the in-flight short-circuit and flagged the pending set. Either
+                -- way, fire one setDirty and clear the pending flag. Prefetch-only
+                -- completions (off-screen pages) skip this to avoid e-ink flicker.
+                local want_repaint = repaint or self._pending_repaint_pages[page]
+                self._pending_repaint_pages[page] = nil
+                if want_repaint and self.canvas and self.canvas.dimen then
+                    UIManager:setDirty(self, "partial", self.canvas.dimen)
+                end
                 on_done()
-            end)
-        self._fetch_handles[page] = handle
+                return
+            end
+            -- Failure: transient (retry) vs permanent (give up). A flaky link
+            -- often produces a single timeout/truncation; retrying recovers the
+            -- page instead of blacklisting it until chapter reload.
+            if self._network then self._network:onFailure(stats and stats.err) end
+            self:_recordNetSample(false, stats and stats.throughput_Bps)
+            local attempts = self._page_fetch_retries[page] or 0
+            -- Visibility governs the retry cap. A page that is currently
+            -- on screen (render-path placeholder) must keep retrying until
+            -- it arrives; giving up leaves the "pending" placeholder stuck
+            -- and the document unreadable. Off-screen / prefetch pages
+            -- still respect NET_RETRY_MAX -- there's no point hammering a
+            -- server for a page the user may never see. Visibility is
+            -- re-checked here (not just the repaint flag captured at fetch
+            -- start) so a prefetch fetch whose page scrolled into view
+            -- during the backoff window is also upgraded to infinite retry.
+            local is_visible = repaint
+                or self._pending_repaint_pages[page]
+            if not is_visible then
+                for _, vp in ipairs(self:_currentVisiblePages()) do
+                    if vp == page then is_visible = true; break end
+                end
+            end
+            -- Give up only on a permanent 4xx (server won't serve it) or
+            -- when an OFF-SCREEN page has exhausted its retry budget.
+            local give_up = isPermanentFetchFailure(code)
+                or (not is_visible and attempts >= NET_RETRY_MAX)
+            if not give_up then
+                self._page_fetch_retries[page] = attempts + 1
+                local backoff = NET_RETRY_BACKOFF_S[attempts + 1] or NET_RETRY_BACKOFF_S[#NET_RETRY_BACKOFF_S]
+                local attempt_lbl = is_visible
+                    and tostring(attempts + 1)
+                    or string.format("%d/%d", attempts + 1, NET_RETRY_MAX)
+                logger.dbg(string.format("[kamare:render] page=%d transient fail code=%s err=%s retry %s%s in %ds",
+                    page, tostring(code), (stats and stats.err) or "-", attempt_lbl,
+                    is_visible and " (visible)" or "", backoff))
+                -- Keep _page_fetch_inflight set during the backoff window so the
+                -- dedup short-circuit above suppresses duplicate fetches for the
+                -- same page; the rescheduled do_fetch re-checks the gen token.
+                UIManager:scheduleIn(backoff, function()
+                    if gen == self._prefetch_gen and self.virtual_document then
+                        do_fetch()
+                    else
+                        finish_terminal()
+                        on_done()
+                    end
+                end)
+                return
+            end
+            local why = isPermanentFetchFailure(code) and "" or " (retries exhausted)"
+            logger.dbg(string.format("[kamare:render] page=%d fetch FAIL code=%s err=%s%s",
+                page, tostring(code), (stats and stats.err) or "-", why))
+            self._page_fetch_failed[page] = isPermanentFetchFailure(code) and "permanent" or "transient"
+            finish_terminal()
+            on_done()
+        end
+        if self._network and not self._network:ready() then
+            completed(nil, nil, { err = "network unavailable" })
+            return
+        end
+        local handle = AsyncFetch.fetch(req,
+            { quantum_ms = 60, total_timeout = self:_fetchTimeoutSec() }, completed)
+        -- The client may complete synchronously on a DNS/connect failure.
+        if self._page_fetch_inflight[page] then self._fetch_handles[page] = handle end
     end
 
     do_fetch()
@@ -2865,6 +2939,10 @@ function KamareImageViewer:onClose()
 end
 
 function KamareImageViewer:onCloseWidget()
+    if self._network then self._network:close() end
+    if self._dimensions_retry then UIManager:unschedule(self._dimensions_retry) end
+    if self._dimensions_handle then self._dimensions_handle.cancel() end
+    self._dimensions_handle = nil
     -- Release the singleton slot, but only if it still points at us.
     if KamareImageViewer.active_instance == self then
         KamareImageViewer.active_instance = nil
