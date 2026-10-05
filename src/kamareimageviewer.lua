@@ -26,6 +26,8 @@ local Math = require("optmath")
 local ButtonDialog = require("ui/widget/buttondialog")
 local VIDCache = require("virtualimagedocumentcache")
 local AsyncFetch = require("kamareasyncfetch")
+local KamareNetwork = require("kamarenetwork")
+local rapidjson = require("rapidjson")
 local InfoMessage = require("ui/widget/infomessage")
 local FFIUtil = require("ffi/util")
 local _ = require("gettext")
@@ -65,7 +67,8 @@ local EVICT_BEHIND_KEEP   = 2
 -- (timeouts, truncation, connect/handshake/send errors, 5xx, empty body) is
 -- transient on a flaky link and worth retrying with backoff.
 local function isPermanentFetchFailure(code)
-    if code and code >= 400 and code < 500 then
+    if type(code) == "number" and code >= 400 and code < 500
+        and code ~= 408 and code ~= 429 then
         return true
     end
     return false
@@ -253,6 +256,9 @@ function KamareImageViewer:init()
             settings = self.footer_settings,
         }
     end
+
+    self._network = KamareNetwork.new()
+    self:_recoverDimensions()
 
     KamareImageViewer.active_instance = self
 
@@ -2007,6 +2013,77 @@ function KamareImageViewer:_fetchTimeoutSec()
     return math.min(60, math.max(15, math.floor(t)))
 end
 
+-- Metadata can fail independently of image downloads. Retry asynchronously
+-- within this viewer's lifetime; never keep rendering a chapter with stale
+-- fallback dimensions just because its opening request lost DNS.
+function KamareImageViewer:_recoverDimensions()
+    local doc = self.virtual_document
+    if not doc or doc:_hasCompleteDimensions() or self._dimensions_pending then return end
+    local chapter = self.metadata and (self.metadata.chapterId or self.metadata.chapter_id)
+    if not chapter then return end
+    local req = KavitaClient:buildDimensionsRequestTable(chapter)
+    if not req then return end
+    local gen = self._prefetch_gen
+    self._dimensions_pending = true
+    local function retry()
+        self._dimensions_pending = false
+        if self.virtual_document ~= doc or self._prefetch_gen ~= gen then return end
+        self._dimensions_retry = function() self:_recoverDimensions() end
+        UIManager:scheduleIn(5, self._dimensions_retry)
+    end
+    if self._network and not self._network:ready() then retry(); return end
+    local handle = AsyncFetch.fetch(req, { total_timeout = 30 }, function(body, code, stats)
+        self._dimensions_handle = nil
+        if self.virtual_document ~= doc or self._prefetch_gen ~= gen then return end
+        local ok, dims = false, nil
+        if body and code == 200 then ok, dims = pcall(rapidjson.decode, body) end
+        if ok and type(dims) == "table" then
+            local zero_based = false
+            for _, d in ipairs(dims) do
+                if type(d) == "table" and (d.pageNumber or d.page or d.page_num) == 0 then zero_based = true end
+            end
+            local normalized = {}
+            for _, d in ipairs(dims) do
+                if type(d) == "table" then
+                    local n = d.pageNumber or d.page or d.page_num
+                    if type(n) == "number" and type(d.width) == "number" and type(d.height) == "number"
+                        and d.width > 0 and d.height > 0 then
+                        normalized[#normalized + 1] = { pageNumber = n + (zero_based and 1 or 0), width = d.width, height = d.height }
+                    end
+                end
+            end
+            doc:preloadDimensions(normalized)
+            if doc:_hasCompleteDimensions() then
+                self._dimensions_pending = false
+                doc._dual_page_offset, doc._dual_page_pairs, doc._dual_page_pair_index = nil, nil, nil
+                doc:_buildDualPageLayout()
+                doc:clearCache()
+                if self.canvas then self.canvas._layout_dirty = true end
+                if self.view_mode == 1 then self._pending_scroll_page = self._images_list_cur end
+                logger.info("Kamare: page dimensions recovered")
+                self:update()
+                return
+            end
+        end
+        if self._network then self._network:onFailure(stats and stats.err) end
+        if isPermanentFetchFailure(code) then
+            self._dimensions_pending = false
+            logger.warn("Kamare: metadata recovery rejected, HTTP", code)
+            return
+        end
+        retry()
+    end)
+    if self._dimensions_pending then self._dimensions_handle = handle end
+end
+
+function KamareImageViewer:onSuspend()
+    if self._network then self._network:suspend() end
+end
+
+function KamareImageViewer:onResume()
+    if self._network then self._network:resume() end
+end
+
 -- Core of the async page pipeline (shared by prefetch and the render path):
 -- make sure page `page` has a rendered tile set, fetching its image via the
 -- non-blocking client if needed. Dedups concurrent requests for the same page
@@ -2027,6 +2104,9 @@ function KamareImageViewer:_ensurePageReady(page, gen, on_done, repaint)
 
     if not self.virtual_document or gen ~= self._prefetch_gen then
         on_done(); return
+    end
+    if repaint and self._page_fetch_failed[page] == "transient" then
+        self._page_fetch_failed[page] = nil
     end
     if self._page_fetch_failed[page] then
         logger.dbg(string.format("[kamare:render] page=%d ensure skip (failed)", page))
@@ -2085,9 +2165,7 @@ function KamareImageViewer:_ensurePageReady(page, gen, on_done, repaint)
             finish_terminal()
             on_done(); return
         end
-        local handle = AsyncFetch.fetch(req,
-            { quantum_ms = 60, total_timeout = self:_fetchTimeoutSec() },
-            function(body, code, stats)
+        local function completed(body, code, stats)
                 if gen ~= self._prefetch_gen or not self.virtual_document then
                     finish_terminal()
                     on_done(); return
@@ -2119,6 +2197,7 @@ function KamareImageViewer:_ensurePageReady(page, gen, on_done, repaint)
                 -- Failure: transient (retry) vs permanent (give up). A flaky link
                 -- often produces a single timeout/truncation; retrying recovers the
                 -- page instead of blacklisting it until chapter reload.
+                if self._network then self._network:onFailure(stats and stats.err) end
                 self:_recordNetSample(false, stats and stats.throughput_Bps)
                 local attempts = self._page_fetch_retries[page] or 0
                 -- Visibility governs the retry cap. A page that is currently
@@ -2166,11 +2245,18 @@ function KamareImageViewer:_ensurePageReady(page, gen, on_done, repaint)
                 local why = isPermanentFetchFailure(code) and "" or " (retries exhausted)"
                 logger.dbg(string.format("[kamare:render] page=%d fetch FAIL code=%s err=%s%s",
                     page, tostring(code), (stats and stats.err) or "-", why))
-                self._page_fetch_failed[page] = true
+                self._page_fetch_failed[page] = isPermanentFetchFailure(code) and "permanent" or "transient"
                 finish_terminal()
                 on_done()
-            end)
-        self._fetch_handles[page] = handle
+        end
+        if self._network and not self._network:ready() then
+            completed(nil, nil, { err = "network unavailable" })
+            return
+        end
+        local handle = AsyncFetch.fetch(req,
+            { quantum_ms = 60, total_timeout = self:_fetchTimeoutSec() }, completed)
+        -- The client may complete synchronously on a DNS/connect failure.
+        if self._page_fetch_inflight[page] then self._fetch_handles[page] = handle end
     end
 
     do_fetch()
@@ -2865,6 +2951,10 @@ function KamareImageViewer:onClose()
 end
 
 function KamareImageViewer:onCloseWidget()
+    if self._network then self._network:close() end
+    if self._dimensions_retry then UIManager:unschedule(self._dimensions_retry) end
+    if self._dimensions_handle then self._dimensions_handle.cancel() end
+    self._dimensions_handle = nil
     -- Release the singleton slot, but only if it still points at us.
     if KamareImageViewer.active_instance == self then
         KamareImageViewer.active_instance = nil
